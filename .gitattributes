@@ -1,0 +1,11 @@
+* text=auto
+*.rs text
+*.toml text
+*.json text
+*.md text
+*.lock text
+*.jar binary
+*.dll binary
+*.pdb binary
+*.png binary
+*.gz binary

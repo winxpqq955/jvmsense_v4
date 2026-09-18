@@ -1,0 +1,38 @@
+# Project-scoped Codex MCP configuration. Loaded when this project is trusted.
+
+[mcp_servers.intellij]
+url = "http://127.0.0.1:64342/stream"
+http_headers = { IJ_MCP_SERVER_PROJECT_PATH = "D:/jvmsense_v4" }
+
+[mcp_servers.context7]
+url = "https://mcp.context7.com/mcp"
+
+[mcp_servers.tavily]
+url = "https://mcp.tavily.com/mcp/"
+
+[mcp_servers.deepwiki]
+url = "https://mcp.deepwiki.com/mcp"
+
+[mcp_servers.deepwiki.tools.ask_question]
+approval_mode = "approve"
+
+[mcp_servers.deepwiki.tools.read_wiki_structure]
+approval_mode = "approve"
+
+[mcp_servers.deepwiki.tools.read_wiki_contents]
+approval_mode = "approve"
+
+[mcp_servers.github]
+url = "https://api.githubcopilot.com/mcp/"
+http_headers_helper = "node .codex/mcp-github-headers.js"
+
+[mcp_servers.codegraph]
+command = "node"
+args = [
+  "C:/Users/winxp/AppData/Local/codegraph/current/lib/dist/bin/codegraph.js",
+  "serve",
+  "--mcp",
+]
+
+[mcp_servers.jprofiler]
+command = "C:/Users/winxp/AppData/Local/Programs/jprofiler16/bin/jpmcp.exe"

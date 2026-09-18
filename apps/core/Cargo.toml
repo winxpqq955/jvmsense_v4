@@ -1,0 +1,40 @@
+[package]
+name = "jvmsense-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "In-memory Java application launcher and protection core"
+
+[lib]
+name = "jvmsense_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jvmsense"
+path = "src/bin/jvmsense.rs"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+ristretto_classfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zip.workspace = true
+flate2.workspace = true
+sha2.workspace = true
+zstd.workspace = true
+dashmap.workspace = true
+dunce.workspace = true
+rand.workspace = true
+parking_lot.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+jni.workspace = true
+minhook.workspace = true
+windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
