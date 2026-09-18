@@ -146,7 +146,10 @@ pub fn run(request: &LaunchRequest, vfs: VirtualFileSystem) -> Result<LaunchOutc
     let main_class = request.main_class.clone();
     let arguments = request.arguments.clone();
 
-    let (completed, error) = crate::native::with_vfs(Arc::clone(&vfs), || {
+    // Fabric discovery uses ForkJoin workers. Publish the VFS process-wide for
+    // the launch lifetime so those workers resolve the same virtual paths as
+    // the thread that invokes the main class.
+    let (completed, error) = crate::native::with_launch_vfs(Arc::clone(&vfs), || {
         // The launching thread must be named `main`.
         //
         // The JVM names the thread that called `JNI_CreateJavaVM` `main` and
