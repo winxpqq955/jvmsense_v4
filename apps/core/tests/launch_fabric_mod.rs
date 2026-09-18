@@ -8,15 +8,28 @@ mod support;
 
 #[test]
 fn modmenu_is_flattened_for_pre_jvm_fabric_discovery() {
-    let jar = support::ensure_modmenu().expect("obtain Mod Menu");
-    let bytes = std::fs::read(jar).expect("read Mod Menu");
+    let bytes = support::ensure_modmenu_without_placeholder_api().expect("obtain Mod Menu");
 
     let prepared = prepare_fabric_mod(FabricModImage::from_memory("modmenu-13.0.4.jar", bytes))
         .expect("prepare Mod Menu before JVM creation");
 
+    let mod_ids: Vec<_> = prepared
+        .mods
+        .iter()
+        .map(|image| {
+            parse_runtime_mod(&image.bytes)
+                .expect("reparse prepared mod")
+                .id
+        })
+        .collect();
+    assert_eq!(
+        prepared.mods.len(),
+        6,
+        "Mod Menu plus its five required Fabric modules must become explicit launch-time mods"
+    );
     assert!(
-        prepared.mods.len() > 1,
-        "Mod Menu's declared nested Fabric mods must become explicit launch-time mods"
+        !mod_ids.contains(&"placeholder".to_string()),
+        "Placeholder API is optional and must not enter this focused fixture: {mod_ids:?}"
     );
     assert!(
         prepared.libraries.is_empty(),

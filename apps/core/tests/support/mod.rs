@@ -9,6 +9,7 @@
 #![cfg(windows)]
 #![allow(dead_code)]
 
+use std::io::{Cursor, Read as _, Write as _};
 use std::path::PathBuf;
 
 use jvmsense_core::jdk::JdkProvisioner;
@@ -258,6 +259,120 @@ pub fn ensure_modmenu() -> Option<PathBuf> {
         return None;
     }
     Some(dunce::canonicalize(&path).unwrap_or(path))
+}
+
+/// Obtain Mod Menu bytes without its optional nested Placeholder API module.
+///
+/// Mod Menu 13.0.4 bundles Placeholder API, but the Mixin target used here does
+/// not depend on it. Removing that nested image keeps the authoritative launch
+/// fixture focused on Mod Menu and the Fabric modules it actually requires.
+/// The original downloaded jar remains cached and unchanged.
+pub fn ensure_modmenu_without_placeholder_api() -> Option<Vec<u8>> {
+    let jar = ensure_modmenu()?;
+    let bytes = std::fs::read(jar).ok()?;
+    match remove_nested_mod(&bytes, "placeholder-api-") {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            eprintln!("jvmsense tests: cannot remove Placeholder API: {error}");
+            None
+        }
+    }
+}
+
+fn remove_nested_mod(bytes: &[u8], file_prefix: &str) -> Result<Vec<u8>, String> {
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| format!("open jar: {error}"))?;
+
+    let removed_paths: Vec<String> = {
+        let mut entry = archive
+            .by_name("fabric.mod.json")
+            .map_err(|error| format!("read fabric.mod.json: {error}"))?;
+        let mut metadata_text = String::new();
+        entry
+            .read_to_string(&mut metadata_text)
+            .map_err(|error| format!("read fabric.mod.json: {error}"))?;
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_text)
+            .map_err(|error| format!("parse fabric.mod.json: {error}"))?;
+
+        metadata
+            .get("jars")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("file").and_then(serde_json::Value::as_str))
+            .filter(|path| {
+                path.rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.starts_with(file_prefix))
+            })
+            .map(str::to_string)
+            .collect()
+    };
+
+    if removed_paths.is_empty() {
+        return Ok(bytes.to_vec());
+    }
+
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| format!("reopen jar: {error}"))?;
+    let skipped: std::collections::HashSet<&str> =
+        removed_paths.iter().map(String::as_str).collect();
+    let mut out = Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(&mut out);
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| format!("read entry {index}: {error}"))?;
+        let name = entry.name().to_string();
+        if skipped.contains(name.as_str()) {
+            continue;
+        }
+
+        let compression = entry.compression();
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(compression);
+        let mut data = Vec::new();
+        entry
+            .read_to_end(&mut data)
+            .map_err(|error| format!("read {name}: {error}"))?;
+
+        if name == "fabric.mod.json" {
+            let mut metadata: serde_json::Value =
+                serde_json::from_slice(&data).map_err(|error| format!("parse {name}: {error}"))?;
+            if let Some(jars) = metadata
+                .get_mut("jars")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                jars.retain(|entry| {
+                    entry
+                        .get("file")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(|path| !skipped.contains(path))
+                });
+            }
+            data = serde_json::to_vec(&metadata)
+                .map_err(|error| format!("rewrite {name}: {error}"))?;
+        }
+
+        if entry.is_dir() {
+            writer
+                .add_directory(&name, options)
+                .map_err(|error| format!("write directory {name}: {error}"))?;
+        } else {
+            writer
+                .start_file(&name, options)
+                .map_err(|error| format!("write {name}: {error}"))?;
+            writer
+                .write_all(&data)
+                .map_err(|error| format!("write {name}: {error}"))?;
+        }
+    }
+
+    writer
+        .finish()
+        .map_err(|error| format!("finish jar: {error}"))?;
+    Ok(out.into_inner())
 }
 
 pub fn ensure_minecraft_intermediary_mapping() -> Option<PathBuf> {

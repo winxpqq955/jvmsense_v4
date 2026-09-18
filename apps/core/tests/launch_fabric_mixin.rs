@@ -10,6 +10,7 @@ use jni::{InitArgsBuilder, JNIVersion, JavaVM};
 use jvmsense_core::launch::{FabricApplication, FabricModImage};
 use jvmsense_core::native::HookSet;
 use jvmsense_core::remap::{official_to_intermediary, TinyRemapRequest};
+use jvmsense_core::vfs::ArtifactRole;
 
 mod support;
 
@@ -111,8 +112,7 @@ fn modmenu_is_mixed_in_at_target_class_load_time() {
         }
     }
     let loader_image = loader_image.expect("Fabric Loader image");
-    let mod_path = support::ensure_modmenu().expect("Mod Menu");
-    let mod_bytes = std::fs::read(&mod_path).expect("read Mod Menu");
+    let mod_bytes = support::ensure_modmenu_without_placeholder_api().expect("Mod Menu");
 
     let app = FabricApplication::mount_remapped_launch_images(
         work.path().join("session"),
@@ -134,6 +134,12 @@ fn modmenu_is_mixed_in_at_target_class_load_time() {
             .iter()
             .any(jvmsense_core::launch::ClasspathEntry::is_hollow),
         "Fabric Loader itself must be memory-backed"
+    );
+    assert!(
+        !app.vfs
+            .with_role(ArtifactRole::Mod)
+            .any(|mounted| mounted.file_name().starts_with("placeholder-api-")),
+        "the optional Placeholder API bundle must not be mounted for this focused fixture"
     );
     assert!(
         app.layout.mods.len() > 2,
