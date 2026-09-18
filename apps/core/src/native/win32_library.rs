@@ -314,22 +314,23 @@ pub fn enable() -> Result<(), String> {
     unsafe { minhook::MinHook::enable_all_hooks() }.map_err(|status| format!("{status:?}"))
 }
 
-/// Install the Win32 hooks, matching a library at an explicit placeholder path.
+/// Install the Win32 hooks, matching a library at an explicit virtual path.
 ///
 /// A VM resolves a library *name* to a path before asking the OS loader, and
 /// OpenJ9 only proceeds if that path exists on `java.library.path`. So the
-/// session writes a zero-length placeholder at a known location and the hook
-/// matches that full path. The placeholder is the same hollow-path trick the
-/// jar side uses, applied to natives: the file is real, its bytes are not.
+/// session registers a virtual path at a known location and the hook matches
+/// that full path. The path is the same virtual-path model the jar side uses,
+/// applied to natives: native metadata hooks report it, while its image stays
+/// in memory.
 ///
 /// # Errors
 ///
 /// See [`install_loader_hooks`].
 pub fn install_loader_hooks_at(
     libraries: impl IntoIterator<Item = crate::native::lib::ManagedLibrary>,
-    placeholder_path: &str,
+    virtual_path: &str,
 ) -> Result<Vec<&'static str>, String> {
-    let normalized = crate::vfs::pathkey::normalize_str(placeholder_path);
+    let normalized = crate::vfs::pathkey::normalize_str(virtual_path);
     install_loader_hooks_with(
         libraries,
         Box::new(move |requested: &str| {

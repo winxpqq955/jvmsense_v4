@@ -8,12 +8,12 @@
 //! measured rather than assumed:
 //!
 //! - The VFS must exist before the JVM, because the classpath is built from its
-//!   placeholder paths.
+//!   virtual paths.
 //! - The JVM must exist before the hooks, because `java.dll` and `nio.dll` are
 //!   loaded by (or lazily after) JVM creation — `GetProcAddress` on a module
 //!   that is not loaded yet simply fails.
 //! - The session must be published to the hooks before any application class
-//!   loads, because the first `ZipFile` on a placeholder is what needs it.
+//!   loads, because the first `ZipFile` on a virtual artifact is what needs it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -66,7 +66,7 @@ impl LaunchOutcome {
 
 /// Run a launch to completion.
 ///
-/// `vfs` is taken by value and held for the duration, so every placeholder
+/// `vfs` is taken by value and held for the duration, so every virtual path
 /// lives exactly as long as the launch that needs it.
 ///
 /// # Errors
@@ -210,8 +210,8 @@ pub fn run(request: &LaunchRequest, vfs: VirtualFileSystem) -> Result<LaunchOutc
     // Nothing was written: assert the invariant here rather than only in tests,
     // because a launch that leaks an artifact silently defeats the whole crate.
     let footprint = vfs.disk_footprint();
-    if !crate::vfs::hollow::all_placeholders_empty(&footprint) {
-        eprintln!("jvmsense: WARNING an artifact byte reached disk: {footprint:?}");
+    if !crate::vfs::hollow::no_materialized_files(&footprint) {
+        eprintln!("jvmsense: WARNING a materialized artifact file reached disk: {footprint:?}");
     }
 
     drop(hooks);
@@ -342,13 +342,13 @@ pub fn request_from_fabric(
     }
 }
 
-/// Create a private directory for one session's placeholders.
+/// Create a private directory for one session's virtual paths.
 ///
 /// # Why the location matters
 ///
 /// The directory must resolve to itself. Windows redirects many "local app
 /// data" paths through a junction — a packaged app's `LocalCache` is the common
-/// case, and this machine has one — and a placeholder reached through a
+/// case, and this machine has one — and a virtual path reached through a
 /// junction has a `toRealPath()` that differs from its literal path. The
 /// application asserts `path.equals(path.toRealPath())`, so that difference
 /// surfaces much later as a file that seemingly exists but cannot be found.
@@ -364,7 +364,7 @@ pub fn request_from_fabric(
 /// to itself.
 pub fn create_session_directory() -> Result<PathBuf, LaunchError> {
     // Named unpredictably, so two concurrent launches cannot see each other's
-    // placeholders — which would let one session serve another's bytes, since
+    // virtual paths — which would let one session serve another's bytes, since
     // the hooks match on path.
     let unique = format!(
         "session-{:016x}",

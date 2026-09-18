@@ -1,8 +1,8 @@
 //! Content-addressed store of artifact bytes.
 //!
 //! Every byte an application needs lives here, in `Arc<[u8]>`, for the life of
-//! the session. Nothing is written to disk except the zero-length placeholders
-//! that give the bytes a path the JVM will accept (see `vfs::hollow`).
+//! the session. No artifact file is written to disk; virtual paths give the bytes
+//! addresses the JVM will accept (see `vfs::hollow`).
 //!
 //! Artifacts arrive as *payloads*: the bytes on disk are a zstd-compressed or
 //! identity-encoded blob, and the manifest carries the SHA-256 and decoded

@@ -2,9 +2,9 @@
 //!
 //! The design goal is that no Java bytecode an application needs ever reaches
 //! disk in analysable form. The mechanism is a *hollow-path* virtual file
-//! system: every artifact exists on disk as a zero-length placeholder, the
-//! real bytes live only in this process's memory, and native hooks serve every
-//! read of a placeholder from those bytes. See `spikes/FINDINGS.md` for the
+//! system: every artifact receives a virtual path, the real bytes live only in
+//! this process's memory, and native hooks serve every read of that path from
+//! those bytes. See `spikes/FINDINGS.md` for the
 //! probes that established this is viable, and why the alternatives are not.
 //!
 //! The primary correctness path is launch-time Fabric preparation in

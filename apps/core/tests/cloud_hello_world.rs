@@ -1,4 +1,4 @@
-//! Cloud-load a real HelloWorld jar: no jar bytes on disk, only a placeholder.
+//! Cloud-load a real HelloWorld jar: no jar bytes or artifact file on disk.
 //!
 //! Run with:
 //!
@@ -16,7 +16,7 @@
 //!
 //! This is the strongest available statement of the design goal. It runs a real
 //! application, compiled by a stock `javac` and packaged by a stock `jar`, with
-//! the archive present on disk as **zero bytes**, and asserts that the
+//! the archive held only in memory, and asserts that the
 //! application:
 //!
 //!   - loaded and ran,
@@ -24,7 +24,7 @@
 //!   - read its own class bytes back through the classloader,
 //!   - saw a non-empty file through `Files.size`,
 //!
-//! while the placeholder on disk stayed empty the whole time.
+//! while no artifact file appeared on disk.
 
 #![cfg(windows)]
 
@@ -64,14 +64,13 @@ fn a_real_helloworld_jar_runs_with_no_bytes_on_disk() {
     let class_count = mounted.index().expect("indexed").class_count();
     assert!(class_count >= 2, "expected HelloWorld and Greeter");
 
-    assert_eq!(
-        std::fs::metadata(&hollow_path).expect("stat").len(),
-        0,
-        "the placeholder on disk must be empty"
+    assert!(
+        !hollow_path.exists(),
+        "the virtual artifact path must not have a materialized file"
     );
-    println!("jar is {real_jar_len} bytes in memory, 0 bytes on disk");
+    println!("jar is {real_jar_len} bytes in memory, with no file on disk");
 
-    // Create a JVM whose app classpath is this jar's hollow placeholder. Unlike
+    // Create a JVM whose app classpath is this jar's virtual path. Unlike
     // the earlier end-to-end test, the application classloader must be able to
     // load from it, which is what makes this a real launch rather than a probe.
     let args = InitArgsBuilder::new()
@@ -83,7 +82,7 @@ fn a_real_helloworld_jar_runs_with_no_bytes_on_disk() {
     let dll = jdk.jvm_dll();
     let jvm: JavaVM = JavaVM::with_libjvm(args, move || Ok(dll.clone())).expect("create JVM");
 
-    // Hooks must be installed before any class is loaded from the placeholder.
+    // Hooks must be installed before any class is loaded from the virtual path.
     let hooks = HookSet::install_read_hooks(jdk.home()).expect("install hooks");
     println!("installed {} hooks", hooks.installed().len());
 
@@ -150,7 +149,7 @@ fn a_real_helloworld_jar_runs_with_no_bytes_on_disk() {
             // Read the resource that lives beside the classes.
             let resource_value = read_resource(&mut env, &class_obj, "/greeting.properties");
 
-            // `Files.size` on the placeholder must report the real length.
+            // `Files.size` on the virtual path must report the real length.
             let jar_size = files_size(&mut env, &hollow_path);
 
             (jar_entry, own_class_bytes, resource_value, jar_size)
@@ -158,7 +157,7 @@ fn a_real_helloworld_jar_runs_with_no_bytes_on_disk() {
 
     println!("own class bytes: {own_class_bytes}");
     println!("resource: {resource_value:?}");
-    println!("Files.size(placeholder): {jar_size}");
+    println!("Files.size(virtual path): {jar_size}");
 
     assert_eq!(
         jar_entry, "entry found",
@@ -177,7 +176,7 @@ fn a_real_helloworld_jar_runs_with_no_bytes_on_disk() {
     // `getResourceAsStream` on the application classloader goes through
     // `URLClassPath$JarLoader`, whose URL cache is populated from the
     // *filesystem view* of the jar at the moment the URL was first opened. That
-    // view is a zero-length placeholder, so the loader caches a URL it will
+    // view is virtual, so the loader may cache a URL it will
     // never re-resolve. `JarFile.getJarEntry` on the same hollow path finds the
     // entry, so the bytes are served correctly — this is a classloader caching
     // behaviour, not a hole in the byte serving.
@@ -190,13 +189,13 @@ fn a_real_helloworld_jar_runs_with_no_bytes_on_disk() {
     );
     assert_eq!(
         jar_size, real_jar_len,
-        "Files.size must report the virtual length, not the placeholder's zero"
+        "Files.size must report the virtual length"
     );
 
     let footprint = vfs.disk_footprint();
     assert!(
-        jvmsense_core::vfs::hollow::all_placeholders_empty(&footprint),
-        "no artifact byte may reach disk: {footprint:?}"
+        jvmsense_core::vfs::hollow::no_materialized_files(&footprint),
+        "no artifact file may be materialized on disk: {footprint:?}"
     );
 
     let trace = jvmsense_core::native::trace_snapshot();

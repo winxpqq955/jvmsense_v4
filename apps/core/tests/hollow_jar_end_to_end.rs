@@ -4,7 +4,7 @@
 //! with a throwaway binary, this drives the real [`VirtualFileSystem`] and the
 //! real `native::HookSet` — the same code paths a launch uses — and asserts
 //! that `java.util.zip.ZipFile` returns the artifact's bytes while the file on
-//! disk stays zero-length.
+//! file appears on disk.
 //!
 //! It is `#[ignore]`d by default because it creates a real JVM, which is slow
 //! and requires a JDK. Run it with:
@@ -62,7 +62,7 @@ fn a_jvm_reads_a_hollow_jar_from_memory() {
         ],
     );
 
-    // Mount it: load, verify, index, and materialize a hollow placeholder.
+    // Mount it: load, verify, index, and register a virtual path.
     let mut vfs = VirtualFileSystem::create(work.path().join("session")).expect("create vfs");
     vfs.mount(
         ArtifactRole::Game,
@@ -78,10 +78,9 @@ fn a_jvm_reads_a_hollow_jar_from_memory() {
         .expect("mounted")
         .path()
         .to_path_buf();
-    assert_eq!(
-        std::fs::metadata(&hollow_path).expect("stat").len(),
-        0,
-        "the placeholder must start empty"
+    assert!(
+        !hollow_path.exists(),
+        "the virtual artifact path must not start with a materialized file"
     );
 
     // Create the JVM. The classpath is deliberately empty: nothing on disk
@@ -124,7 +123,7 @@ fn a_jvm_reads_a_hollow_jar_from_memory() {
                 .expect("new File");
 
             // `File.length()` must report the *virtual* length even though the
-            // placeholder on disk is zero bytes. Asserting the real length here
+            // disk file is absent. Asserting the real length here
             // is what caught the `WinNTFileSystem` hook being missing: a zero
             // here means the hook is not serving this path.
             let reported_len = env
@@ -134,7 +133,7 @@ fn a_jvm_reads_a_hollow_jar_from_memory() {
                 .expect("j");
             assert!(
                 reported_len > 0,
-                "File.length() must report the virtual length, not the placeholder's zero"
+                "File.length() must report the virtual length"
             );
 
             let zip = match env.new_object(
@@ -214,8 +213,8 @@ fn a_jvm_reads_a_hollow_jar_from_memory() {
     // The whole point: nothing was written.
     let footprint = vfs.disk_footprint();
     assert!(
-        jvmsense_core::vfs::hollow::all_placeholders_empty(&footprint),
-        "no artifact byte may reach disk: {footprint:?}"
+        jvmsense_core::vfs::hollow::no_materialized_files(&footprint),
+        "no artifact file may be materialized on disk: {footprint:?}"
     );
 
     let (hits, misses) = jvmsense_core::native::hit_miss_counts();

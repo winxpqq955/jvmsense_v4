@@ -105,7 +105,7 @@ pub const HOLLOW_READ_SYMBOLS: &[NativeSymbol] = &[
 /// `java.io.File` attribute queries.
 ///
 /// `File.length()` and `File.isFile()` must report the *virtual* length and
-/// existence, not the placeholder's. `File.length()` is not merely cosmetic:
+/// existence, not the host filesystem's. `File.length()` is not merely cosmetic:
 /// code that sizes a buffer from it would read zero bytes and then fail
 /// confusingly far from the cause.
 pub const FILE_ATTRIBUTE_SYMBOLS: &[NativeSymbol] = &[
@@ -190,6 +190,33 @@ pub const NIO_READ_SYMBOLS: &[NativeSymbol] = &[
         symbol: "Java_sun_nio_fs_WindowsNativeDispatcher_GetFileAttributesEx0",
         family: SymbolFamily::NioOpen,
         label: "niofs.getFileAttributesEx0",
+    },
+    // Path existence and `toRealPath()` traversal need direct metadata even when
+    // no artifact file exists for the OS to stat.
+    NativeSymbol {
+        symbol: "Java_sun_nio_fs_WindowsNativeDispatcher_GetFileAttributes0",
+        family: SymbolFamily::NioOpen,
+        label: "niofs.getFileAttributes0",
+    },
+    NativeSymbol {
+        symbol: "Java_sun_nio_fs_WindowsNativeDispatcher_FindFirstFile0",
+        family: SymbolFamily::NioOpen,
+        label: "niofs.findFirstFile0",
+    },
+    NativeSymbol {
+        symbol: "Java_sun_nio_fs_WindowsNativeDispatcher_FindClose",
+        family: SymbolFamily::NioOpen,
+        label: "niofs.findClose",
+    },
+    NativeSymbol {
+        symbol: "Java_sun_nio_fs_WindowsNativeDispatcher_CloseHandle",
+        family: SymbolFamily::NioOpen,
+        label: "niofs.closeHandle",
+    },
+    NativeSymbol {
+        symbol: "Java_sun_nio_fs_WindowsNativeDispatcher_GetFinalPathNameByHandle",
+        family: SymbolFamily::NioOpen,
+        label: "niofs.getFinalPathNameByHandle",
     },
 ];
 

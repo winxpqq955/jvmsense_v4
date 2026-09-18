@@ -5,7 +5,7 @@
 //! `new ZipFile(path.toFile())`, and classifies the result into the Minecraft
 //! game jar, its libraries, and the loader itself. That design is what the
 //! hollow-path VFS exists to satisfy — every one of those entries is a
-//! zero-length placeholder whose bytes live in this process.
+//! virtual path whose bytes live in this process.
 //!
 //! # What this module decides
 //!
@@ -31,7 +31,7 @@
 //!
 //! The resulting default pipeline is deliberately pre-JVM: parse each mod,
 //! flatten its nested jars, remap/bake when required, mount every image behind
-//! a zero-byte placeholder, and register the explicit mod list before Java code
+//! a virtual path, and register the explicit mod list before Java code
 //! starts. Fabric and Mixin then handle discovery, AccessWideners, and class
 //! transformation at class-load time. JVMTI is not part of this path.
 
@@ -115,7 +115,7 @@ pub struct PreparedFabricMods {
 /// Loader and mod images for one pre-JVM Fabric launch.
 #[derive(Debug, Clone, Default)]
 pub struct FabricLaunchImages {
-    /// Fabric Loader roots to flatten and mount behind loader placeholders.
+    /// Fabric Loader roots to flatten and mount behind loader virtual paths.
     pub loaders: Vec<FabricModImage>,
     /// Fabric mod roots to flatten and register through `fabric.addMods`.
     pub mods: Vec<FabricModImage>,
@@ -311,7 +311,7 @@ pub enum ClasspathEntry {
     /// A real file on disk. Used for the loader and its dependencies, which
     /// Fabric requires to be visible to its own classloader.
     Real(PathBuf),
-    /// A hollow placeholder whose bytes the VFS serves from memory.
+    /// A virtual path whose bytes the VFS serves from memory.
     Hollow(PathBuf),
 }
 
@@ -433,7 +433,7 @@ impl FabricLayout {
         );
 
         // Mods come from the explicit list rather than a directory scan, since
-        // the jars are memory-backed placeholders with generated names.
+        // the jars are memory-backed virtual paths with generated names.
         if !self.mods.is_empty() {
             let separator = Self::classpath_separator();
             properties.insert(
@@ -470,7 +470,7 @@ impl FabricApplication {
     /// # Errors
     ///
     /// Returns [`MountError`] if the game jar or a mod cannot be verified,
-    /// indexed, or given a placeholder.
+    /// indexed, or mounted at a virtual path.
     pub fn mount(
         session_root: impl AsRef<Path>,
         game_jar: &Path,
@@ -505,7 +505,7 @@ impl FabricApplication {
     /// # Errors
     ///
     /// Returns [`MountError`] if the game jar or a mod cannot be verified,
-    /// indexed, or given a placeholder.
+    /// indexed, or mounted at a virtual path.
     pub fn mount_mod_images(
         session_root: impl AsRef<Path>,
         game_jar: &Path,
@@ -534,12 +534,12 @@ impl FabricApplication {
     /// Mount a game image that was remapped in this process.
     ///
     /// The bytes have no payload file by construction; the VFS indexes them and
-    /// exposes only its usual zero-length placeholder to Fabric.
+    /// exposes only a virtual path to Fabric.
     ///
     /// # Errors
     ///
     /// Returns [`MountError`] if the remapped image, or a mod, cannot be
-    /// indexed or given a placeholder.
+    /// indexed, or mounted at a virtual path.
     pub fn mount_remapped(
         session_root: impl AsRef<Path>,
         game_name: &str,
@@ -573,7 +573,7 @@ impl FabricApplication {
     /// # Errors
     ///
     /// Returns [`MountError`] if an image cannot be prepared, indexed, or given
-    /// a placeholder.
+    /// a virtual path.
     pub fn mount_remapped_mod_images(
         session_root: impl AsRef<Path>,
         game_name: &str,
@@ -607,7 +607,7 @@ impl FabricApplication {
     /// # Errors
     ///
     /// Returns [`FabricMountError`] if any image cannot be prepared, indexed, or
-    /// given a zero-byte placeholder.
+    /// mounted at a virtual path.
     pub fn mount_remapped_launch_images(
         session_root: impl AsRef<Path>,
         game_name: &str,
@@ -932,12 +932,10 @@ mod tests {
                 "Fabric must discover {} before the JVM starts",
                 entry.path().display()
             );
-            assert_eq!(
-                std::fs::metadata(entry.path())
-                    .expect("stat mod placeholder")
-                    .len(),
-                0,
-                "launch-time mod bytes must not reach disk"
+            assert!(
+                !entry.path().exists(),
+                "launch-time mod artifact must not reach disk: {}",
+                entry.path().display()
             );
         }
     }
@@ -988,12 +986,9 @@ mod tests {
         .expect("mount");
 
         assert!(app.layout.game_jar.is_hollow());
-        assert_eq!(
-            std::fs::metadata(app.layout.game_jar.path())
-                .expect("stat")
-                .len(),
-            0,
-            "the game jar's placeholder must be empty on disk"
+        assert!(
+            !app.layout.game_jar.path().exists(),
+            "the game jar must not have an artifact file on disk"
         );
         for entry in &app.layout.loader_jars {
             let ClasspathEntry::Real(path) = entry else {
@@ -1004,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn the_game_jar_property_points_at_the_placeholder() {
+    fn the_game_jar_property_points_at_the_virtual_path() {
         let dir = tempfile::tempdir().expect("tempdir");
         let game = dir.path().join("game.jar");
         write_game_jar(&game);

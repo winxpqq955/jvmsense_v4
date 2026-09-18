@@ -1,9 +1,9 @@
 //! Starting a Java application, with its bytes served from memory.
 //!
 //! [`fabric`] covers the Fabric path: preparing a layout, choosing the system
-//! properties, and mounting the game jar and mods as hollow placeholders. A
+//! properties, and mounting the game jar and mods at virtual paths. A
 //! plain (non-Fabric) application needs no such preparation — it is just a
-//! classpath of placeholders and a main class — so it has no module of its own.
+//! classpath of virtual paths and a main class — so it has no module of its own.
 
 pub mod fabric;
 pub mod session;

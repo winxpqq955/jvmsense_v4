@@ -2,8 +2,8 @@
 //!
 //! Every virtual artifact is keyed by a normalized absolute path. Getting this
 //! wrong is silent and expensive: the native hooks match on these strings, so a
-//! mismatch means a read falls through to the 0-byte placeholder and the
-//! application sees an empty file.
+//! mismatch means a read bypasses the virtual artifact and sees the host
+//! filesystem's result instead.
 //!
 //! Two Windows-specific rules, both established by the V1/V2 probes:
 //!
@@ -99,7 +99,7 @@ pub fn normalize_str(raw: &str) -> String {
 /// Resolve `.` and `..` textually, and drop a redundant trailing separator.
 ///
 /// This is deliberately textual rather than filesystem-based: the path may
-/// refer to a placeholder that does not exist yet, and we must not touch disk
+/// refer to a virtual path that has no disk file, and we must not touch disk
 /// (or a reparse point) to compute a key.
 fn collapse_components(path: &str) -> String {
     // Preserve a drive prefix (`C:`) or a UNC prefix (`\\server\share`).

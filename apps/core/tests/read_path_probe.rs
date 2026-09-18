@@ -35,7 +35,7 @@ mod support;
 /// One read path, as a Java expression to evaluate and a JNI signature.
 struct PathProbe {
     label: &'static str,
-    /// A `java.nio.file.Path` built from the placeholder.
+    /// A `java.nio.file.Path` built from the virtual artifact.
     java: &'static str,
 }
 
@@ -61,7 +61,10 @@ fn report_which_read_paths_the_current_hooks_serve() {
         .expect("mounted")
         .path()
         .to_path_buf();
-    assert_eq!(std::fs::metadata(&hollow).expect("stat").len(), 0);
+    assert!(
+        !hollow.exists(),
+        "the virtual artifact must have no disk file"
+    );
 
     let args = InitArgsBuilder::new()
         .version(JNIVersion::V8)
@@ -85,7 +88,7 @@ fn report_which_read_paths_the_current_hooks_serve() {
         results
     });
 
-    println!("=== read paths against a hollow placeholder ===");
+    println!("=== read paths against a virtual artifact ===");
     println!("(real jar length is {real_len} bytes)\n");
 
     let mut failures = Vec::new();

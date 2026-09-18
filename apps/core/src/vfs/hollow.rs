@@ -1,42 +1,35 @@
-//! Zero-length placeholder files that give virtual bytes a real path.
+//! Virtual paths that give in-memory bytes a stable filesystem-shaped address.
 //!
-//! V1 established that fabric-loader opens jars with
-//! `new java.util.zip.ZipFile(path.toFile())` at ten call sites, and that
-//! `Path.toFile()` throws for any path outside the default file system
-//! (`vfs::probe`'s V6 result). A pure in-memory `FileSystemProvider` therefore
-//! cannot serve Fabric at all.
+//! Java's archive APIs insist on ordinary absolute paths. The native open/read
+//! layer therefore treats these registry entries as virtual regular files:
+//! open returns a synthetic handle, metadata reports the in-memory length, and
+//! reads copy bytes from the process. No artifact directory entry is created on
+//! disk.
 //!
-//! The workaround is a *hollow* path: a real, zero-length file on disk whose
-//! only job is to satisfy `toRealPath`, `Files.exists`, `Files.readAttributes`
-//! and `ZipFile`'s cache-key computation. Every read of it is intercepted at
-//! the native layer and answered from [`crate::artifact`], so no bytecode ever
-//! reaches disk — only the placeholder's directory entry does.
+//! Two rules keep jar identity intact:
 //!
-//! Two invariants make this safe, both from the V1/V2 probes:
-//!
-//! 1. **One placeholder per artifact.** `ZipFile$Source` caches sources in a
-//!    static map keyed by `(File, BasicFileAttributes)`. Two virtual jars
-//!    sharing a placeholder path would alias each other's contents.
-//! 2. **Never trust the on-disk size.** The placeholder is zero bytes; the
-//!    real length lives here. The `length`/`size` hooks must return this value
-//!    or `ZipFile` gives up immediately.
+//! 1. **One virtual path per artifact.** `ZipFile$Source` caches sources by
+//!    path attributes, so two virtual jars sharing a path would alias each
+//!    other's contents.
+//! 2. **Never consult the disk.** The real length lives in memory; metadata and
+//!    read hooks must synthesize it or `ZipFile` gives up immediately.
 
 use std::path::{Path, PathBuf};
 
 use crate::vfs::pathkey::{PathError, VirtualPath};
 
-/// A placeholder file plus the size its reads should report.
+/// A virtual path plus the size its reads should report.
 #[derive(Debug, Clone)]
 pub struct HollowFile {
     path: VirtualPath,
     virtual_len: u64,
-    /// Set when this placeholder is a directory (used for native-library dirs).
+    /// Set when this virtual node is a real directory (used for the Fabric mods directory).
     is_directory: bool,
 }
 
 impl HollowFile {
-    /// Reconstruct a placeholder descriptor for a file created outside the
-    /// owning `HollowTree` (used by the runtime-mount overlay).
+    /// Reconstruct a virtual-file descriptor created outside the owning
+    /// `HollowTree` (used by the runtime-mount overlay).
     pub(crate) fn new_file(path: VirtualPath, virtual_len: u64) -> Self {
         Self {
             path,
@@ -45,7 +38,7 @@ impl HollowFile {
         }
     }
 
-    /// The placeholder's normalized path, which is what the hooks match on.
+    /// The normalized virtual path, which is what the hooks match on.
     #[must_use]
     pub fn path(&self) -> &VirtualPath {
         &self.path
@@ -57,17 +50,17 @@ impl HollowFile {
         self.virtual_len
     }
 
-    /// True when this placeholder stands in for a directory.
+    /// True when this node stands in for a directory.
     #[must_use]
     pub fn is_directory(&self) -> bool {
         self.is_directory
     }
 }
 
-/// Creates placeholders under a session directory and removes them on drop.
+/// Registers virtual paths under a session directory and removes the directory on drop.
 ///
 /// Owning the cleanup in a `Drop` impl means a panicking or early-returning
-/// launch still tidies up, rather than leaving a directory of empty files
+/// launch still tidies up, rather than leaving stale virtual-path registry state
 /// behind that the next session would have to reason about.
 #[derive(Debug)]
 pub struct HollowTree {
@@ -105,35 +98,22 @@ impl HollowTree {
         &self.root
     }
 
-    /// Materialize a placeholder for a virtual file of `virtual_len` bytes.
+    /// Register a virtual file without materializing any file or parent directory.
     ///
-    /// `role` groups placeholders (`game`, `libraries`, `mods`, `natives`);
-    /// `name` must be unique within the role, which is what keeps the
-    /// one-placeholder-per-artifact invariant.
+    /// The native open layer hands out a synthetic handle for this path and reads
+    /// from memory. Only real directories created explicitly by
+    /// [`HollowTree::add_directory`] may appear below the session root.
     ///
     /// # Errors
     ///
-    /// Returns [`PathError::Io`] if the placeholder cannot be created.
+    /// Returns [`PathError::Relative`] if the derived path is not absolute.
     pub fn add_file(
         &mut self,
         role: &str,
         name: &str,
         virtual_len: u64,
     ) -> Result<&HollowFile, PathError> {
-        let dir = self.root.join(role);
-        std::fs::create_dir_all(&dir).map_err(|source| PathError::Io {
-            path: dir.clone(),
-            source,
-        })?;
-        let path = dir.join(name);
-
-        // Truncate rather than create-new: a stale placeholder from a crashed
-        // session is fine to reuse, and its content is never read anyway.
-        std::fs::write(&path, b"").map_err(|source| PathError::Io {
-            path: path.clone(),
-            source,
-        })?;
-
+        let path = self.root.join(role).join(name);
         let normalized = VirtualPath::new(&path)?;
         self.files.push(HollowFile {
             path: normalized,
@@ -168,32 +148,27 @@ impl HollowTree {
         Ok(self.files.last().expect("just pushed"))
     }
 
-    /// Every placeholder created so far.
+    /// Every virtual path created so far.
     #[must_use]
     pub fn files(&self) -> &[HollowFile] {
         &self.files
     }
 
-    /// Look up a placeholder by its normalized path.
+    /// Look up a virtual path by its normalized key.
     #[must_use]
     pub fn find(&self, path: &VirtualPath) -> Option<&HollowFile> {
         self.files.iter().find(|f| &f.path == path)
     }
 
-    /// Snapshot the on-disk sizes of every placeholder.
+    /// Every regular file below the session root.
     ///
-    /// The verification mode compares two of these to prove that no bytecode
-    /// was written: every placeholder must still be zero bytes, and no file
-    /// may have appeared that is not in the snapshot.
+    /// This scan is deliberately not tied to the registry: a stale or leaked
+    /// artifact file is a materialization failure, whether empty or non-empty.
+    /// Explicit empty directories do not violate the invariant.
     #[must_use]
     pub fn snapshot(&self) -> Vec<(String, u64)> {
         let mut out = Vec::new();
-        for file in &self.files {
-            let len = std::fs::metadata(file.path.to_path_buf())
-                .map(|m| m.len())
-                .unwrap_or(0);
-            out.push((file.path.to_string(), len));
-        }
+        collect_files(&self.root, &mut out);
         out.sort();
         out
     }
@@ -216,13 +191,31 @@ impl Drop for HollowTree {
     }
 }
 
-/// True when every snapshot entry is zero bytes.
+fn collect_files(dir: &Path, out: &mut Vec<(String, u64)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_files(&path, out);
+        } else if file_type.is_file() {
+            let len = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            out.push((path.to_string_lossy().into_owned(), len));
+        }
+    }
+}
+
+/// True only when no materialized file exists.
 ///
-/// This is the "did anything leak to disk" check, factored out so the caller
-/// can run it before teardown removes the evidence.
+/// Empty and non-empty files are both failures: the invariant is that artifact
+/// paths have no disk file at all, not merely that their disk file is empty.
 #[must_use]
-pub fn all_placeholders_empty(snapshot: &[(String, u64)]) -> bool {
-    snapshot.iter().all(|(_, len)| *len == 0)
+pub fn no_materialized_files(snapshot: &[(String, u64)]) -> bool {
+    snapshot.is_empty()
 }
 
 #[cfg(test)]
@@ -230,7 +223,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_placeholder_is_created_empty_on_disk() {
+    fn a_virtual_file_is_not_materialized_on_disk() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut tree = HollowTree::create(dir.path().join("session")).expect("create");
 
@@ -239,11 +232,9 @@ mod tests {
             .expect("add")
             .clone();
 
-        assert_eq!(
-            std::fs::metadata(file.path().to_path_buf())
-                .expect("stat")
-                .len(),
-            0
+        assert!(
+            !file.path().to_path_buf().exists(),
+            "virtual artifact paths must not have a disk file"
         );
         assert_eq!(
             file.virtual_len(),
@@ -253,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn placeholders_with_different_roles_do_not_alias() {
+    fn virtual_paths_with_different_roles_do_not_alias() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut tree = HollowTree::create(dir.path().join("session")).expect("create");
 
@@ -291,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_reports_zero_for_every_placeholder() {
+    fn the_session_root_contains_no_materialized_files() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut tree = HollowTree::create(dir.path().join("session")).expect("create");
         tree.add_file("game", "a.jar", 999).expect("add");
@@ -299,18 +290,18 @@ mod tests {
 
         let snapshot = tree.snapshot();
 
-        assert_eq!(snapshot.len(), 2);
-        assert!(all_placeholders_empty(&snapshot));
+        assert!(snapshot.is_empty());
+        assert!(no_materialized_files(&snapshot));
     }
 
     #[test]
-    fn a_non_empty_placeholder_is_detected_by_the_leak_check() {
+    fn empty_and_nonempty_regular_files_are_detected_by_the_session_audit() {
         let snapshot = vec![("/x/a.jar".to_string(), 0), ("/x/b.jar".to_string(), 42)];
-        assert!(!all_placeholders_empty(&snapshot));
+        assert!(!no_materialized_files(&snapshot));
     }
 
     #[test]
-    fn find_locates_a_placeholder_by_path() {
+    fn find_locates_a_virtual_path_by_its_key() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut tree = HollowTree::create(dir.path().join("session")).expect("create");
         let added = tree
@@ -324,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_placeholder_is_marked_as_such() {
+    fn a_directory_virtual_path_is_marked_as_a_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut tree = HollowTree::create(dir.path().join("session")).expect("create");
 

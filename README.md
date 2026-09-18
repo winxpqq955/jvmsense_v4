@@ -2,12 +2,20 @@
 
 jvmsense v4 是一个 Windows/JVM 导向的 Rust 2021 workspace，核心目标是在启动 Java 应用时让应用需要的字节码不以可分析的完整文件形式落盘。
 
-当前主 crate 是 `apps/core` 中的 `jvmsense-core`。它实现了一条 **hollow-path 虚拟文件系统**路径：
+当前主 crate 是 `apps/core` 中的 `jvmsense-core`。它实现了一条 **虚拟路径文件系统**：
 
-- 磁盘上的每个 artifact 只存在为 **0 字节 placeholder**；
+- 每个 artifact 只有一个虚拟路径，路径下 **没有任何磁盘文件**；
 - 真实字节保存在当前进程内存；
-- Windows native hooks 拦截 Java/JVM 对 placeholder 的打开、长度查询和读取；
+- Windows native hooks 为 Java/JVM 合成打开句柄、元数据、长度与读取；
 - Java 侧看到的仍是普通路径、普通 jar 与普通类加载流程。
+
+Native 层的设计是：
+
+- 先把规范化路径分类为虚拟普通文件、虚拟祖先目录或非虚拟路径；
+- 只为只读打开分配合成句柄，句柄独立维护 cursor 与关闭生命周期；
+- 同时覆盖 `RandomAccessFile`、Windows NIO、属性元数据与目录遍历；
+- 写入、创建和未知路径回落到原实现，保留正常错误语义；
+- launch 结束后递归扫描 session root，任何普通文件都视为失败。
 
 ## Fabric 正确性路径：launch 前注入
 
@@ -59,7 +67,7 @@ cargo test --locked --test launch_fabric_mixin -- --ignored --nocapture
 - Fabric Loader 和 Mod Menu 均为内存镜像；
 - 目标类首次加载时 Mixin 方法已经存在；
 - 全程未启用 JVMTI redefine；
-- placeholder 保持 0 字节；
+- 会话目录递归审计为 0 个 artifact 文件；
 - 嵌套 mod 没有被提取到 `.fabric/processedMods`。
 
 ## 版本控制边界

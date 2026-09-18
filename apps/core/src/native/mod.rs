@@ -3,7 +3,7 @@
 //! This productizes what the V1 probe proved. The probe showed that a small
 //! set of `RandomAccessFile` hooks is enough for `java.util.zip.ZipFile` — and
 //! therefore for fabric-loader's ten `new ZipFile(path.toFile())` call sites —
-//! to read a jar whose on-disk form is a zero-length placeholder.
+//! to read a jar that has no on-disk form.
 //!
 //! The design constraint that shapes everything here is that the hooks are
 //! process-global `extern "system"` functions, but the state they need (the

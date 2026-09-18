@@ -381,8 +381,8 @@ fn loaded_title_screen_is_redefined_with_static_handlers() {
         "the redefined class must contain a Mod Menu Mixin handler"
     );
     assert!(
-        footprint.iter().all(|(_, len)| *len == 0),
-        "all runtime and startup placeholders must remain zero bytes: {footprint:?}"
+        footprint.is_empty(),
+        "no runtime or startup artifact may be materialized on disk: {footprint:?}"
     );
     assert!(
         !jvmsense_core::native::trace_snapshot().entries.is_empty(),

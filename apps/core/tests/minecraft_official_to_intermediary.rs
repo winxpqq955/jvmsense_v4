@@ -139,7 +139,7 @@ fn official_client_remaps_in_memory_and_knot_loads_the_af_inner_class() {
         "fabric.development must remain disabled for in-memory injection"
     );
 
-    let game_placeholder = app.layout.game_jar.path().to_path_buf();
+    let game_path = app.layout.game_jar.path().to_path_buf();
     let intermediary_name = "net.minecraft.class_156$2";
     let (official_present, intermediary_present) = {
         let mounted = app
@@ -161,11 +161,8 @@ fn official_client_remaps_in_memory_and_knot_loads_the_af_inner_class() {
         intermediary_present,
         "intermediary {intermediary_name} must exist in the game image"
     );
-    assert_eq!(
-        std::fs::metadata(&game_placeholder)
-            .expect("stat intermediary placeholder")
-            .len(),
-        0,
+    assert!(
+        !game_path.exists(),
         "the intermediary game image must not be written to disk"
     );
 
@@ -517,11 +514,8 @@ fn official_client_remaps_in_memory_and_knot_loads_the_af_inner_class() {
         runtime_mod_class, "com.terraformersmc.modmenu.ModMenu",
         "the runtime mod jar must be visible through Knot"
     );
-    assert_eq!(
-        std::fs::metadata(&runtime_mod_path)
-            .expect("stat runtime mod placeholder")
-            .len(),
-        0,
+    assert!(
+        !runtime_mod_path.exists(),
         "the runtime mod must not be written to disk"
     );
     assert!(
@@ -540,12 +534,9 @@ fn official_client_remaps_in_memory_and_knot_loads_the_af_inner_class() {
         trace.hits > 0,
         "Knot must have read the intermediary game through hollow VFS"
     );
-    assert_eq!(
-        std::fs::metadata(&game_placeholder)
-            .expect("stat intermediary placeholder after launch")
-            .len(),
-        0,
-        "the intermediary game image must remain zero bytes on disk"
+    assert!(
+        !game_path.exists(),
+        "the intermediary game image must have no file on disk after launch"
     );
 
     drop(hooks);

@@ -1,4 +1,4 @@
-//! The virtual file system: artifact bytes, jar indexes, and the placeholder
+//! The virtual file system: artifact bytes, jar indexes, and the virtual paths
 //! paths that let a JVM address them.
 //!
 //! This is the module that makes "load a normal jar without writing it to
@@ -6,7 +6,7 @@
 //!
 //! - [`artifact::ArtifactStore`] — the bytes, verified.
 //! - [`jar::JarIndex`] — what is inside each archive.
-//! - [`hollow::HollowTree`] — the zero-length placeholders those bytes are
+//! - [`hollow::HollowTree`] — the virtual paths those bytes are
 //!   addressed by.
 //!
 //! Unlike the predecessor, none of it is a process global. A [`VirtualFileSystem`]
@@ -27,7 +27,7 @@ use crate::vfs::jar::{JarError, JarIndex};
 use crate::vfs::pathkey::{PathError, VirtualPath};
 
 /// How an artifact participates in a launch. The role decides which
-/// placeholder subdirectory it lands in, which keeps a game jar from ever
+/// virtual-path subdirectory it lands in, which keeps a game jar from ever
 /// colliding with a library of the same file name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactRole {
@@ -42,7 +42,7 @@ pub enum ArtifactRole {
 }
 
 impl ArtifactRole {
-    /// The placeholder subdirectory name for this role.
+    /// The virtual-path subdirectory name for this role.
     #[must_use]
     pub fn dir_name(self) -> &'static str {
         match self {
@@ -54,11 +54,11 @@ impl ArtifactRole {
     }
 }
 
-/// One artifact, indexed and given a placeholder path.
+/// One artifact, indexed and mounted at a virtual path.
 #[derive(Debug)]
 pub struct MountedArtifact {
     role: ArtifactRole,
-    /// The file name as the manifest gave it, used for the placeholder name.
+    /// The file name as the manifest gave it, used for the virtual file name.
     file_name: String,
     sha256_hex: String,
     hollow: HollowFile,
@@ -85,13 +85,13 @@ impl MountedArtifact {
         &self.sha256_hex
     }
 
-    /// The placeholder path this artifact is addressed by.
+    /// The virtual path this artifact is addressed by.
     #[must_use]
     pub fn hollow(&self) -> &HollowFile {
         &self.hollow
     }
 
-    /// The placeholder path, convenient for building system properties.
+    /// The virtual path, convenient for building system properties.
     #[must_use]
     pub fn path(&self) -> &VirtualPath {
         self.hollow.path()
@@ -134,7 +134,7 @@ impl RuntimeMount {
         &self.sha256_hex
     }
 
-    /// The zero-length placeholder path.
+    /// The virtual path.
     #[must_use]
     pub fn path(&self) -> &VirtualPath {
         self.hollow.path()
@@ -158,7 +158,7 @@ struct RuntimeState {
 pub struct VirtualFileSystem {
     artifacts: ArtifactStore,
     tree: HollowTree,
-    /// Normalized placeholder path -> mounted artifact index.
+    /// Normalized virtual path -> mounted artifact index.
     by_path: HashMap<VirtualPath, usize>,
     mounted: Vec<MountedArtifact>,
     /// Mutable overlay for artifacts injected after launch.
@@ -166,7 +166,7 @@ pub struct VirtualFileSystem {
 }
 
 impl VirtualFileSystem {
-    /// Create a VFS whose placeholders live under `session_root`.
+    /// Create a VFS whose virtual paths live under `session_root`.
     ///
     /// # Errors
     ///
@@ -209,13 +209,12 @@ impl VirtualFileSystem {
     ///
     /// This is how a remapped jar enters the launch: its bytes come from the
     /// remapper process through a pipe, are stored under their digest, and the
-    /// only filesystem representation is the usual zero-length placeholder.
+    /// path has no filesystem representation; native hooks serve its bytes.
     ///
     /// # Errors
     ///
     /// Returns [`MountError::Jar`] when `index` is true and the bytes are not
-    /// a usable archive, and [`MountError::Path`] if the placeholder cannot be
-    /// created.
+    /// a usable archive, and [`MountError::Path`] if the virtual path is invalid.
     pub fn mount_memory(
         &mut self,
         role: ArtifactRole,
@@ -252,14 +251,14 @@ impl VirtualFileSystem {
             None
         };
 
-        // The placeholder name must be unique within the role. Prefixing with
-        // the content hash guarantees that two manifests that happen to share a
-        // file name still get distinct placeholders, which is the invariant
-        // `ZipFile$Source`'s path-keyed cache depends on.
-        let placeholder_name = format!("{}-{file_name}", &sha256_hex[..16]);
+        // The virtual path must be unique within the role. Prefixing with the
+        // content hash guarantees that two manifests that happen to share a file
+        // name still get distinct paths, which is the invariant `ZipFile$Source`'s
+        // path-keyed cache depends on.
+        let virtual_name = format!("{}-{file_name}", &sha256_hex[..16]);
         let hollow = self
             .tree
-            .add_file(role.dir_name(), &placeholder_name, virtual_len)?
+            .add_file(role.dir_name(), &virtual_name, virtual_len)?
             .clone();
 
         let position = self.mounted.len();
@@ -275,17 +274,12 @@ impl VirtualFileSystem {
         Ok(self.mounted.last().expect("just pushed"))
     }
 
-    /// Mount and index bytes through the runtime overlay.
-    ///
-    /// Unlike [`Self::mount_memory`], this takes `&self`, so it can be called
-    /// after the VFS has been shared with the native hooks. The only
-    /// filesystem artifact is the usual zero-length placeholder.
+    /// Mount and index bytes through the runtime overlay without materializing a file.
     ///
     /// # Errors
     ///
     /// Returns [`MountError::Jar`] when `index` is true and the bytes are not
-    /// a usable archive, and [`MountError::Path`] if the placeholder cannot be
-    /// created.
+    /// a usable archive, and [`MountError::Path`] if the virtual path is invalid.
     pub fn mount_memory_runtime(
         &self,
         role: ArtifactRole,
@@ -297,23 +291,9 @@ impl VirtualFileSystem {
         let sha256_hex = crate::artifact::hex_lower(&digest);
 
         let file_name = sanitize_file_name(file_name);
-        let dir = self.tree.root().join(role.dir_name());
-        std::fs::create_dir_all(&dir).map_err(|source| MountError::Path {
-            source: PathError::Io {
-                path: dir.clone(),
-                source,
-            },
-        })?;
-        let placeholder_name = format!("{}-{file_name}", &sha256_hex[..16]);
-        let path = dir.join(placeholder_name);
-        std::fs::write(&path, b"").map_err(|source| MountError::Path {
-            source: PathError::Io {
-                path: path.clone(),
-                source,
-            },
-        })?;
+        let virtual_name = format!("{}-{file_name}", &sha256_hex[..16]);
+        let path = self.tree.root().join(role.dir_name()).join(virtual_name);
         let normalized = VirtualPath::new(&path)?;
-
         let bytes: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
         let jar_index = if index {
             let artifact = crate::artifact::Artifact::from_memory(Arc::clone(&bytes), digest);
@@ -353,6 +333,51 @@ impl VirtualFileSystem {
             return true;
         }
         self.runtime.read().by_path.contains_key(&normalized)
+    }
+
+    /// True when `path` is an ancestor directory of at least one virtual artifact.
+    ///
+    /// `Path.toRealPath()` resolves each parent component before it reaches the
+    /// virtual file, so the native metadata layer must answer for those prefixes
+    /// even though it never creates role directories.
+    #[must_use]
+    pub fn is_virtual_directory(&self, path: &str) -> bool {
+        let Ok(normalized) = VirtualPath::new(path) else {
+            return false;
+        };
+        if self
+            .tree
+            .files()
+            .iter()
+            .any(|node| node.is_directory() && node.path() == &normalized)
+        {
+            return true;
+        }
+        let prefix = format!("{}\\", normalized.as_str());
+        if self
+            .by_path
+            .keys()
+            .any(|path| path.as_str().starts_with(&prefix))
+        {
+            return true;
+        }
+        self.runtime
+            .read()
+            .by_path
+            .keys()
+            .any(|path| path.as_str().starts_with(&prefix))
+    }
+
+    /// A virtual path as a regular file, or as an ancestor directory.
+    #[must_use]
+    pub fn virtual_node(&self, path: &str) -> Option<bool> {
+        if self.contains_path(path) {
+            return Some(false);
+        }
+        if self.is_virtual_directory(path) {
+            return Some(true);
+        }
+        None
     }
 
     /// Runtime-mounted artifacts, in mount order.
@@ -470,18 +495,13 @@ impl VirtualFileSystem {
             .map(|a| Arc::clone(a.bytes()))
     }
 
-    /// Snapshot of every placeholder's on-disk size, for the leak audit.
+    /// Every regular file below the session root, for the no-materialization audit.
+    ///
+    /// Runtime mounts live in the same session tree, so one recursive scan covers
+    /// startup and runtime artifacts alike.
     #[must_use]
     pub fn disk_footprint(&self) -> Vec<(String, u64)> {
-        let mut out = self.tree.snapshot();
-        for mount in &self.runtime.read().mounts {
-            let len = std::fs::metadata(mount.path().to_path_buf())
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
-            out.push((mount.path().to_string(), len));
-        }
-        out.sort();
-        out
+        self.tree.snapshot()
     }
 
     /// The session root directory.
@@ -535,7 +555,7 @@ pub enum MountError {
     Internal(String),
 }
 
-/// Build a placeholder name from a manifest file name, keeping only characters
+/// Build a virtual file name from a manifest file name, keeping only characters
 /// that are safe in a path component.
 #[must_use]
 pub fn sanitize_file_name(name: &str) -> String {
@@ -682,14 +702,16 @@ mod tests {
                 .expect("resource present"),
             b"{}"
         );
-        assert_eq!(std::fs::metadata(path).expect("stat placeholder").len(), 0);
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "runtime artifact path must not be materialized"
+        );
         assert_eq!(shared.runtime_mounts().len(), 1);
     }
     #[test]
-    fn a_mounted_artifact_gets_a_zero_length_placeholder() {
+    fn a_mounted_artifact_has_no_materialized_file() {
         let (dir, mut vfs) = vfs_with_tempdir();
-        // Incompressible content, so the jar's on-disk size is substantial and
-        // the placeholder's zero length is a meaningful observation.
+        // Incompressible content, so a leaked file would be easy to detect.
         let payload: Vec<u8> = (0..8192u32).flat_map(u32::to_le_bytes).collect();
         let jar = make_jar(dir.path(), "game.jar", &[("a/C.class", &payload)]);
         let spec = identity_spec("game.jar", jar).expect("spec");
@@ -699,18 +721,14 @@ mod tests {
             .mount(ArtifactRole::Game, "game.jar", &spec, true)
             .expect("mount");
 
-        // The bytes exist only in memory; the path on disk is empty.
-        assert_eq!(
-            std::fs::metadata(mounted.path().to_path_buf())
-                .expect("stat")
-                .len(),
-            0,
-            "the placeholder must be zero bytes on disk"
+        assert!(
+            !mounted.path().to_path_buf().exists(),
+            "virtual artifact paths must not have a materialized file"
         );
         assert_eq!(
             mounted.hollow().virtual_len(),
             jar_len,
-            "reads must report the real archive length, not the placeholder's"
+            "reads must report the real archive length"
         );
     }
 
@@ -730,10 +748,10 @@ mod tests {
         assert_eq!(resolved.file_name(), "game.jar");
     }
 
-    /// The one-placeholder-per-artifact rule, from the V1 probe: two jars with
-    /// the same file name must still get distinct placeholder paths.
+    /// The one-virtual-path-per-artifact rule, from the V1 probe: two jars with
+    /// the same file name must still get distinct virtual paths.
     #[test]
-    fn artifacts_with_the_same_name_get_distinct_placeholders() {
+    fn artifacts_with_the_same_name_get_distinct_virtual_paths() {
         let (dir, mut vfs) = vfs_with_tempdir();
         let a = make_jar(dir.path(), "a.jar", &[("a/C.class", b"first")]);
         let b = make_jar(dir.path(), "b.jar", &[("a/C.class", b"second")]);
@@ -815,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn the_disk_footprint_is_all_zeroes() {
+    fn the_disk_footprint_is_empty() {
         let (dir, mut vfs) = vfs_with_tempdir();
         let jar = make_jar(dir.path(), "game.jar", &[("a/C.class", &[1u8; 4096])]);
         vfs.mount(
@@ -828,10 +846,9 @@ mod tests {
 
         let footprint = vfs.disk_footprint();
 
-        assert!(!footprint.is_empty());
         assert!(
-            crate::vfs::hollow::all_placeholders_empty(&footprint),
-            "no artifact byte may reach disk"
+            footprint.is_empty(),
+            "no artifact file may exist on disk: {footprint:?}"
         );
     }
 

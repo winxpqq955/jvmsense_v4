@@ -25,7 +25,7 @@ remove nested jar entries and "jars" metadata
 mount bytes in the in-process VFS
         |
         v
-create 0-byte placeholders and classpath entries
+register virtual paths and build classpath entries
         |
         v
 create JVM with Fabric properties
@@ -38,6 +38,19 @@ Mixin transforms target classes on first load
 ```
 
 The important boundary is the JVM creation call. Everything above it happens in Rust and owns the complete image bytes. Everything below it sees ordinary paths and jar files, while native hooks serve the actual bytes from memory.
+
+## Native open/read layer
+
+The Windows native layer is an open/read implementation for virtual paths, not a writer of special disk entries:
+
+- **Path classification.** The VFS answers each normalized path as a virtual regular file, a virtual ancestor directory, or no virtual node. Unknown paths go to the stock JDK/Windows implementation.
+- **Synthetic handles.** Read-only opens allocate unique negative handles from a process-local table. Each handle owns its byte buffer and cursor, so independent opens of one artifact cannot share file offsets. Closing removes the table entry and invalidates the Java file descriptor.
+- **Legacy I/O.** `java.io.RandomAccessFile` open, read, bulk read, length, seek, pointer, and close are connected to the synthetic handle table. Write modes use the original JDK implementation and therefore receive normal read/write errors.
+- **NIO.** `WindowsNativeDispatcher.CreateFile0` serves read-only `OPEN_EXISTING` requests, while NIO read, positional read, seek, size, and close operations use per-handle state. Other access and creation modes pass through.
+- **Metadata and traversal.** Attribute, file-information, size, find-first, find-close, final-path, and `File` attribute/length requests are synthesized so `Path.toRealPath()`, `Files`, `JarFile`, and `ZipFile` observe a consistent filesystem shape.
+- **Audit.** The session root is scanned recursively after launch; any regular file, empty or not, is a materialization failure.
+
+This keeps Fabric on ordinary Java archive APIs while all registered game, loader, mod, and library bytes remain in process memory.
 
 ## Preparation rules
 
@@ -61,19 +74,20 @@ The controlling Rust thread has a thread-local VFS scope, but Fabric discovery a
 - Java worker threads can resolve paths from the active launch VFS;
 - the previous process-wide value is restored after the launch closure exits, including unwinds.
 
-This is why Fabric's worker threads can read memory-backed jars instead of seeing empty placeholders.
+This is why Fabric's worker threads can read memory-backed jars without requiring disk files under those paths.
 
 ## Correctness invariants
 
 The launch-time path must preserve all of the following:
 
-1. Every on-disk artifact placeholder is exactly 0 bytes.
-2. No complete game, loader, mod, or library jar is written to disk.
-3. Fabric Loader and Mod Menu are accepted from in-memory images.
-4. The target class has Mixin-added members the first time Java resolves it.
-5. No nested mod is extracted under `.fabric/processedMods`.
-6. `fabric.development` is not enabled.
-7. The launch path does not call JVMTI `RedefineClasses`.
+1. No artifact file exists under any registered virtual path.
+2. A recursive session-root audit finds zero regular files.
+3. No complete game, loader, mod, or library jar is written to disk.
+4. Fabric Loader and Mod Menu are accepted from in-memory images.
+5. The target class has Mixin-added members the first time Java resolves it.
+6. No nested mod is extracted under `.fabric/processedMods`.
+7. `fabric.development` is not enabled.
+8. The launch path does not call JVMTI `RedefineClasses`.
 
 The authoritative test is `modmenu_is_mixed_in_at_target_class_load_time` in `apps/core/tests/launch_fabric_mixin.rs`.
 

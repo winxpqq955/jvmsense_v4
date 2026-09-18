@@ -2,7 +2,7 @@
 //!
 //! This is the integration the whole crate has been building toward: a real
 //! `fabric-loader` jar starts, scans its classpath, finds a Minecraft game jar
-//! that exists on disk as **zero bytes**, loads the game's entry point out of
+//! held only in memory, loads the game's entry point out of
 //! it, and calls it.
 //!
 //! The fixture is deliberately minimal rather than a real Minecraft install:
@@ -87,14 +87,13 @@ fn fabric_starts_and_reaches_the_game_main_class() {
     )
     .expect("mount the fabric application");
 
-    let game_placeholder = app.layout.game_jar.path().to_path_buf();
-    assert_eq!(
-        std::fs::metadata(&game_placeholder).expect("stat").len(),
-        0,
-        "the game jar's placeholder must be empty on disk"
+    let game_path = app.layout.game_jar.path().to_path_buf();
+    assert!(
+        !game_path.exists(),
+        "the game jar must not have an artifact file on disk"
     );
     println!(
-        "game jar is {} bytes in memory, 0 bytes on disk",
+        "game jar is {} bytes in memory, no file on disk",
         std::fs::metadata(&game_jar).expect("stat").len()
     );
 
@@ -182,7 +181,7 @@ fn fabric_starts_and_reaches_the_game_main_class() {
     // What this proves, and what it does not.
     //
     // Proven: fabric-loader started, read its own classpath, opened the game
-    // jar — which exists on disk as zero bytes — repeatedly, parsed
+    // jar — which has no file on disk — repeatedly, parsed
     // `version.json` out of it to identify `Minecraft 1.21.4`, located the
     // entry-point class inside it, and handed that class to ASM for patching.
     // Every one of those reads was served from memory.
@@ -242,7 +241,7 @@ fn a_hollow_game_jar_is_classified_as_the_game() {
     // it opens each entry with `new ZipFile(path.toFile())` — the call the
     // hollow-path VFS exists to serve.
     let classpath = app.layout.classpath_string();
-    let placeholder = app.layout.game_jar.path().to_path_buf();
+    let game_path = app.layout.game_jar.path().to_path_buf();
 
     let mut builder = InitArgsBuilder::new()
         .version(JNIVersion::V8)
@@ -260,7 +259,7 @@ fn a_hollow_game_jar_is_classified_as_the_game() {
     let found = jvmsense_core::native::with_vfs_for_test(Arc::clone(&vfs), || {
         let mut env = jvm.attach_current_thread().expect("attach");
         let path = env
-            .new_string(placeholder.to_string_lossy().as_ref())
+            .new_string(game_path.to_string_lossy().as_ref())
             .expect("string");
         let file = env
             .new_object(

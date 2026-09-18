@@ -64,11 +64,9 @@ fn minecraft_inner_class_is_visible_to_jarfile_and_system_classloader() {
         "the Rust jar index must see af$2"
     );
     let hollow_path = mounted.path().to_path_buf();
-    assert_eq!(
-        std::fs::metadata(&hollow_path)
-            .expect("stat placeholder")
-            .len(),
-        0
+    assert!(
+        !hollow_path.exists(),
+        "the virtual artifact path must not exist on disk"
     );
 
     let jdk = support::test_jdk();

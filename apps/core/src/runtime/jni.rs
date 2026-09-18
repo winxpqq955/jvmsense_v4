@@ -5,7 +5,7 @@ use std::path::Path;
 use jni::objects::{JObject, JObjectArray, JValue};
 use jni::JNIEnv;
 
-/// Add a hollow placeholder path to `Knot`'s target class path.
+/// Add a virtual artifact path to `Knot`'s target class path.
 ///
 /// # Errors
 ///

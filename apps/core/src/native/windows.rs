@@ -124,146 +124,134 @@ fn current_vfs() -> Option<Arc<VirtualFileSystem>> {
 }
 
 // ---------------------------------------------------------------------------
-// Cursor state
+// Synthetic open state
 // ---------------------------------------------------------------------------
 
-/// Read position for one open file.
+/// The first handle handed out by the virtual open/read layer.
 ///
-/// A file position belongs to an *open file*, not to a path. `RandomAccessFile`
-/// and a `FileChannel` opened separately are two independent open files with
-/// two independent positions, so they cannot share a cursor: if they did,
-/// `ZipFile` walking a jar would leave the position wherever its last seek
-/// landed, and a later `Files.readAllBytes` would resume from there and return
-/// a short read.
-///
-/// The two families are therefore namespaced. `RandomAccessFile` keys by path
-/// (it has no handle); the nio layer keys by handle (it has no path).
-static CURSORS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, i64>>> =
+/// The value is negative and near `i64::MIN`, far outside the range Windows uses
+/// for `HANDLE` values. It is also distinct from the large positive synthetic
+/// HMODULE values used by memory-loaded native libraries. A handle in this range
+/// can therefore be identified before any OS API is called.
+const VIRTUAL_HANDLE_BASE: i64 = i64::MIN + 0x1000;
+
+/// An open virtual file or a synthetic directory/find handle.
+enum VirtualHandle {
+    File {
+        path: String,
+        bytes: Arc<[u8]>,
+        cursor: i64,
+        is_directory: bool,
+    },
+    Find {
+        path: String,
+    },
+}
+
+#[derive(Default)]
+struct VirtualOpenTable {
+    next_handle: i64,
+    handles: HashMap<i64, VirtualHandle>,
+}
+
+impl VirtualOpenTable {
+    fn allocate(&mut self, handle: VirtualHandle) -> Option<i64> {
+        let value = self.next_handle.checked_add(1)?;
+        let handle_value = self.next_handle;
+        self.next_handle = value;
+        self.handles.insert(handle_value, handle);
+        Some(handle_value)
+    }
+}
+
+static VIRTUAL_OPENS: std::sync::OnceLock<parking_lot::Mutex<VirtualOpenTable>> =
     std::sync::OnceLock::new();
 
-fn cursors() -> &'static parking_lot::Mutex<HashMap<String, i64>> {
-    CURSORS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+fn virtual_opens() -> &'static parking_lot::Mutex<VirtualOpenTable> {
+    VIRTUAL_OPENS.get_or_init(|| {
+        parking_lot::Mutex::new(VirtualOpenTable {
+            next_handle: VIRTUAL_HANDLE_BASE,
+            handles: HashMap::new(),
+        })
+    })
 }
 
-/// Cursor key for a `RandomAccessFile`, which is identified by its path.
-fn raf_cursor_key(path: &str) -> String {
-    format!("raf:{path}")
+fn is_virtual_handle(handle: i64) -> bool {
+    handle >= VIRTUAL_HANDLE_BASE
 }
 
-/// Cursor key for a nio channel, which is identified by its handle.
-fn nio_cursor_key(handle: i64) -> String {
-    format!("nio:{handle}")
+fn open_virtual_file(path: &str, bytes: Arc<[u8]>, is_directory: bool) -> Option<i64> {
+    virtual_opens().lock().allocate(VirtualHandle::File {
+        path: path.to_string(),
+        bytes,
+        cursor: 0,
+        is_directory,
+    })
 }
 
-/// Native handle -> hollow path, for the detours that only receive a
-/// `FileDescriptor`.
-///
-/// `WinNTFileSystem` and the nio `FileDispatcherImpl` methods are handed a
-/// `FileDescriptor`, not a `File`, so they cannot resolve a path the way the
-/// `RandomAccessFile` detours do. They learn the association from here.
-///
-/// The key is `FileDescriptor.handle`, **not** `FileDescriptor.fd`. On Windows
-/// `fd` is a CRT descriptor and is `-1` for every file the JVM opens through
-/// the Win32 handle path — which is all of them, including every `FileChannel`
-/// that `Files.*` uses. Reading `fd` therefore yields `-1` for exactly the
-/// descriptors this map needs to key, which is how the first attempt ended up
-/// registering nothing.
-///
-/// Handles are process-unique while open, so unlike a CRT descriptor they
-/// cannot be recycled into an unrelated file's number underneath us.
-static HANDLE_PATHS: std::sync::OnceLock<parking_lot::Mutex<HashMap<i64, String>>> =
-    std::sync::OnceLock::new();
-
-fn handle_paths() -> &'static parking_lot::Mutex<HashMap<i64, String>> {
-    HANDLE_PATHS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+fn open_virtual_find(path: &str) -> Option<i64> {
+    virtual_opens().lock().allocate(VirtualHandle::Find {
+        path: path.to_string(),
+    })
 }
 
-/// Record that `handle` refers to the hollow file at `path`.
-///
-/// Called from the `RandomAccessFile` detours, where the receiver carries both
-/// a `path` field and a `FileDescriptor`.
-unsafe fn remember_fd_path(env: *mut JNIEnv, receiver: jobject, path: &str) {
-    if let Some(handle) = file_descriptor_handle_of(env, receiver) {
-        if handle != 0 && handle != -1 {
-            handle_paths().lock().insert(handle, path.to_string());
-        }
-    }
-}
-
-/// The hollow path a `FileDescriptor`-only detour should serve, if any.
-unsafe fn hollow_path_for_descriptor(env: *mut JNIEnv, fd_obj: jobject) -> Option<String> {
-    let vfs = current_vfs()?;
-    let handle = file_descriptor_handle(env, fd_obj);
-    if handle == 0 || handle == -1 {
+fn close_virtual_handle(handle: i64) -> Option<VirtualHandle> {
+    if !is_virtual_handle(handle) {
         return None;
     }
-    let path = handle_paths().lock().get(&handle).cloned()?;
-    // Re-check against the session: the map is only meaningful while the path
-    // is still mounted, and a stale entry would serve the wrong bytes.
-    if vfs.contains_path(&path) {
-        Some(path)
-    } else {
-        None
-    }
+    virtual_opens().lock().handles.remove(&handle)
 }
 
-/// Read `receiver.fd` (a `FileDescriptor`) and return its native handle.
-///
-/// # Safety
-///
-/// See [`string_field`].
-unsafe fn file_descriptor_handle_of(env: *mut JNIEnv, receiver: jobject) -> Option<i64> {
-    let t = table(env);
-    let get_field = t.GetFieldID?;
-    let cls = (t.GetObjectClass.unwrap())(env, receiver);
-    if cls.is_null() {
+/// The bytes and current cursor for a virtual file handle.
+fn virtual_file_state(handle: i64) -> Option<(String, Arc<[u8]>, i64, bool)> {
+    if !is_virtual_handle(handle) {
         return None;
     }
-    let id = get_field(
-        env,
-        cls,
-        c"fd".as_ptr(),
-        c"Ljava/io/FileDescriptor;".as_ptr(),
-    );
-    (t.DeleteLocalRef.unwrap())(env, cls);
-    if id.is_null() {
-        clear_pending(env);
+    let table = virtual_opens().lock();
+    let VirtualHandle::File {
+        path,
+        bytes,
+        cursor,
+        is_directory,
+    } = table.handles.get(&handle)?
+    else {
         return None;
-    }
-    let fd_obj = (t.GetObjectField.unwrap())(env, receiver, id);
-    if fd_obj.is_null() {
-        return None;
-    }
-    let handle = file_descriptor_handle(env, fd_obj);
-    (t.DeleteLocalRef.unwrap())(env, fd_obj);
-    Some(handle)
+    };
+    Some((path.clone(), Arc::clone(bytes), *cursor, *is_directory))
 }
 
-/// The hollow path a bare native handle belongs to, if any.
-fn hollow_path_for_handle(handle: i64) -> Option<String> {
-    let vfs = current_vfs()?;
-    if handle == 0 || handle == -1 {
+fn seek_virtual_file(handle: i64, position: i64) -> Option<String> {
+    if !is_virtual_handle(handle) {
         return None;
     }
-    let path = handle_paths().lock().get(&handle).cloned()?;
-    if vfs.contains_path(&path) {
-        Some(path)
-    } else {
-        None
+    let mut table = virtual_opens().lock();
+    let VirtualHandle::File { path, cursor, .. } = table.handles.get_mut(&handle)? else {
+        return None;
+    };
+    *cursor = position;
+    Some(path.clone())
+}
+
+fn advance_virtual_file(handle: i64, count: i64) {
+    let mut table = virtual_opens().lock();
+    if let Some(VirtualHandle::File { cursor, .. }) = table.handles.get_mut(&handle) {
+        *cursor = cursor.saturating_add(count);
     }
 }
 
 /// Decode a NUL-terminated UTF-16 string from a native address.
 ///
-/// `WindowsNativeDispatcher.CreateFile0` receives the path this way rather
-/// than as a Java `String`, so there is no `jstring` to read.
+/// `WindowsNativeDispatcher` receives paths as native wide strings rather than
+/// Java `String` values.
+///
+/// # Safety
+///
+/// `address` must point to a NUL-terminated UTF-16 string.
 unsafe fn wide_c_string_to_string(address: i64) -> Option<String> {
     if address == 0 {
         return None;
     }
     let pointer = address as *const u16;
-    // Bound the scan: a malformed or non-string address must not walk into
-    // unmapped memory looking for a terminator that is not there.
     const MAX_PATH_UNITS: usize = 32 * 1024;
     let mut len = 0usize;
     while len < MAX_PATH_UNITS && *pointer.add(len) != 0 {
@@ -295,12 +283,75 @@ unsafe fn file_descriptor_handle(env: *mut JNIEnv, fd_obj: jobject) -> i64 {
     (t.GetLongField.unwrap())(env, fd_obj, id)
 }
 
-/// Clear a pending exception.
+/// Read `receiver.fd` and return the `FileDescriptor` object's native handle.
+unsafe fn file_descriptor_handle_of(env: *mut JNIEnv, receiver: jobject) -> i64 {
+    let t = table(env);
+    let Some(get_field) = t.GetFieldID else {
+        return -1;
+    };
+    let cls = (t.GetObjectClass.unwrap())(env, receiver);
+    if cls.is_null() {
+        return -1;
+    }
+    let id = get_field(
+        env,
+        cls,
+        c"fd".as_ptr(),
+        c"Ljava/io/FileDescriptor;".as_ptr(),
+    );
+    (t.DeleteLocalRef.unwrap())(env, cls);
+    if id.is_null() {
+        clear_pending(env);
+        return -1;
+    }
+    let fd_obj = (t.GetObjectField.unwrap())(env, receiver, id);
+    if fd_obj.is_null() {
+        return -1;
+    }
+    let handle = file_descriptor_handle(env, fd_obj);
+    (t.DeleteLocalRef.unwrap())(env, fd_obj);
+    handle
+}
+
+/// Set the handle on a stream receiver's nested `FileDescriptor`.
 ///
-/// A failed `GetFieldID` throws, and leaving that pending poisons every later
-/// JNI call on the thread. Since a missing field is an expected outcome here
-/// (the receiver may be any object), the exception must be cleared rather than
-/// propagated.
+/// `RandomAccessFile.open0` is responsible for publishing this field. When the
+/// original native implementation is skipped, the synthetic handle must be
+/// written here or the JDK treats the stream as closed.
+unsafe fn set_receiver_file_descriptor_handle(
+    env: *mut JNIEnv,
+    receiver: jobject,
+    handle: i64,
+) -> bool {
+    let t = table(env);
+    let Some(get_field) = t.GetFieldID else {
+        return false;
+    };
+    let cls = (t.GetObjectClass.unwrap())(env, receiver);
+    if cls.is_null() {
+        return false;
+    }
+    let id = get_field(
+        env,
+        cls,
+        c"fd".as_ptr(),
+        c"Ljava/io/FileDescriptor;".as_ptr(),
+    );
+    (t.DeleteLocalRef.unwrap())(env, cls);
+    if id.is_null() {
+        clear_pending(env);
+        return false;
+    }
+    let fd_obj = (t.GetObjectField.unwrap())(env, receiver, id);
+    if fd_obj.is_null() {
+        return false;
+    }
+    set_long_field(env, fd_obj, "handle", handle);
+    (t.DeleteLocalRef.unwrap())(env, fd_obj);
+    true
+}
+
+/// Clear a pending exception left by a failed field lookup.
 unsafe fn clear_pending(env: *mut JNIEnv) {
     let t = table(env);
     if let Some(check) = t.ExceptionCheck {
@@ -312,24 +363,19 @@ unsafe fn clear_pending(env: *mut JNIEnv) {
     }
 }
 
-/// The `java.io.File.path` of a `File` receiver, if it names a hollow artifact.
-///
-/// `WinNTFileSystem.getLength0(File)` receives a `File`, whose `path` field is
-/// the same string the `RandomAccessFile` detours key on.
+/// A normalized path as a VFS regular file (`false`) or directory (`true`).
+fn virtual_node(path: &str) -> Option<bool> {
+    current_vfs()?.virtual_node(path)
+}
+
+/// The normalized `java.io.File.path`, if it names a virtual artifact.
 unsafe fn hollow_path_of_file(env: *mut JNIEnv, file: jobject) -> Option<String> {
-    let vfs = current_vfs()?;
     let raw = string_field(env, file, "path")?;
     let normalized = crate::vfs::pathkey::normalize_str(&raw);
-    if vfs.contains_path(&normalized) {
-        Some(normalized)
-    } else {
-        None
-    }
+    virtual_node(&normalized).map(|_| normalized)
 }
 
 /// Hook-hit counters, so a launch report can show which paths were exercised.
-/// A miss on every symbol is the fingerprint of the hooks never firing, which
-/// is otherwise hard to distinguish from "the application read nothing".
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
@@ -340,39 +386,56 @@ pub fn hit_miss_counts() -> (u64, u64) {
 }
 
 /// What the detours decided, for the verification report and for tests.
-///
-/// A hook that installs but never fires is the failure mode most easily
-/// mistaken for "the application read nothing", and these counters are the
-/// only way to tell those apart without a debugger.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Trace {
+    /// Number of calls answered from the VFS.
     pub hits: u64,
+    /// Number of calls passed through to the OS.
     pub misses: u64,
-    /// How many times each labelled symbol was entered.
+    /// Hook entry-point name -> call count.
     pub entries: HashMap<&'static str, u64>,
-    /// Files resolved to a hollow artifact, and files that were not.
+    /// VFS paths answered from memory.
     pub resolved: Vec<String>,
+    /// Paths observed by a hook but not served by this session.
     pub unresolved: Vec<String>,
 }
 
-static TRACE: std::sync::OnceLock<parking_lot::Mutex<Trace>> = std::sync::OnceLock::new();
+#[derive(Default, Clone)]
+struct TraceState {
+    hits: u64,
+    misses: u64,
+    entries: HashMap<&'static str, u64>,
+    resolved: Vec<String>,
+    unresolved: Vec<String>,
+}
 
-fn trace() -> &'static parking_lot::Mutex<Trace> {
-    TRACE.get_or_init(|| parking_lot::Mutex::new(Trace::default()))
+impl From<TraceState> for Trace {
+    fn from(value: TraceState) -> Self {
+        Self {
+            hits: value.hits,
+            misses: value.misses,
+            entries: value.entries,
+            resolved: value.resolved,
+            unresolved: value.unresolved,
+        }
+    }
+}
+
+static TRACE: std::sync::OnceLock<parking_lot::Mutex<TraceState>> = std::sync::OnceLock::new();
+
+fn trace() -> &'static parking_lot::Mutex<TraceState> {
+    TRACE.get_or_init(|| parking_lot::Mutex::new(TraceState::default()))
 }
 
 /// Snapshot of the detour trace.
 #[must_use]
 pub fn trace_snapshot() -> Trace {
-    trace().lock().clone()
+    trace().lock().clone().into()
 }
 
 /// Reset the trace.
-///
-/// Tests may run several launches in one process and need each one's counters
-/// in isolation.
 pub fn reset_trace() {
-    *trace().lock() = Trace::default();
+    *trace().lock() = TraceState::default();
 }
 
 fn enter(label: &'static str) {
@@ -397,6 +460,11 @@ fn record_miss(path: Option<&str>) {
     }
 }
 
+/// The bytes of the artifact a virtual path refers to.
+fn hollow_bytes(path: &str) -> Option<Arc<[u8]>> {
+    current_vfs()?.artifact_bytes_by_path(path)
+}
+
 // ---------------------------------------------------------------------------
 // Raw JNI field access
 // ---------------------------------------------------------------------------
@@ -411,9 +479,8 @@ unsafe fn table(env: *mut JNIEnv) -> &'static jni::sys::JNINativeInterface_ {
 /// Read a `String` field off `obj`.
 ///
 /// Returns `None` if the field is absent or the value is null. A missing field
-/// makes `GetFieldID` throw; on that path the pending exception is **cleared**,
-/// because leaving it set poisons every later JNI call on this thread — a far
-/// worse failure than the one being diagnosed.
+/// makes `GetFieldID` throw; on that path the pending exception is cleared so it
+/// cannot poison a later JNI call.
 ///
 /// # Safety
 ///
@@ -423,7 +490,6 @@ unsafe fn string_field(env: *mut JNIEnv, obj: jobject, field: &str) -> Option<St
     let get_field = t.GetFieldID?;
     let name = std::ffi::CString::new(field).ok()?;
     let sig = c"Ljava/lang/String;";
-
     let cls = (t.GetObjectClass.unwrap())(env, obj);
     if cls.is_null() {
         return None;
@@ -431,62 +497,58 @@ unsafe fn string_field(env: *mut JNIEnv, obj: jobject, field: &str) -> Option<St
     let id = get_field(env, cls, name.as_ptr(), sig.as_ptr());
     (t.DeleteLocalRef.unwrap())(env, cls);
     if id.is_null() {
-        // A failed `GetFieldID` leaves a pending `NoSuchFieldError`.
-        if let Some(check) = t.ExceptionCheck {
-            if check(env) != 0 {
-                if let Some(clear) = t.ExceptionClear {
-                    clear(env);
-                }
-            }
-        }
+        clear_pending(env);
         return None;
     }
-
     let value = (t.GetObjectField.unwrap())(env, obj, id);
     if value.is_null() {
         return None;
     }
-    let len = (t.GetStringUTFLength.unwrap())(env, value);
-    let chars = (t.GetStringUTFChars.unwrap())(env, value, std::ptr::null_mut());
-    if chars.is_null() {
-        (t.DeleteLocalRef.unwrap())(env, value);
-        return None;
-    }
-    let text = std::str::from_utf8(std::slice::from_raw_parts(chars as *const u8, len as usize))
-        .ok()
-        .map(str::to_string);
-    (t.ReleaseStringUTFChars.unwrap())(env, value, chars);
+    let result = java_string(env, value);
     (t.DeleteLocalRef.unwrap())(env, value);
-    text
+    result
 }
 
-/// The `path` of a `RandomAccessFile` receiver, if it names a hollow artifact.
+/// Write a Java `String` field using UTF-16.
 ///
-/// This is the single resolution step every read detour funnels through, so a
-/// path that is not ours falls through to the original implementation rather
-/// than being guessed at.
-unsafe fn hollow_path(env: *mut JNIEnv, receiver: jobject) -> Option<String> {
-    let vfs = current_vfs()?;
-    let raw = string_field(env, receiver, "path")?;
-    let normalized = crate::vfs::pathkey::normalize_str(&raw);
-    if vfs.contains_path(&normalized) {
-        Some(normalized)
-    } else {
-        // Record what was asked for: without it, "the hook found no session"
-        // and "the session does not serve this path" are indistinguishable.
-        let mut t = trace().lock();
-        if t.unresolved.len() < 16 {
-            t.unresolved.push(normalized);
-        }
-        None
+/// # Safety
+///
+/// `env` must be valid and `obj` a live object with the named field.
+unsafe fn set_string_field(env: *mut JNIEnv, obj: jobject, field: &str, value: &str) -> bool {
+    let t = table(env);
+    let Some(get_field) = t.GetFieldID else {
+        return false;
+    };
+    let Ok(name) = std::ffi::CString::new(field) else {
+        return false;
+    };
+    let cls = (t.GetObjectClass.unwrap())(env, obj);
+    if cls.is_null() {
+        return false;
     }
+    let id = get_field(env, cls, name.as_ptr(), c"Ljava/lang/String;".as_ptr());
+    (t.DeleteLocalRef.unwrap())(env, cls);
+    if id.is_null() {
+        clear_pending(env);
+        return false;
+    }
+    let Some(string) = new_java_string(env, value) else {
+        return false;
+    };
+    (t.SetObjectField.unwrap())(env, obj, id, string);
+    (t.DeleteLocalRef.unwrap())(env, string);
+    true
 }
 
-/// The bytes of the artifact a hollow path refers to.
-fn hollow_bytes(path: &str) -> Option<Vec<u8>> {
-    let vfs = current_vfs()?;
-    let bytes = vfs.artifact_bytes_by_path(path)?;
-    Some(bytes.to_vec())
+/// Construct a Java `String` through JNI's UTF-16 API.
+///
+/// # Safety
+///
+/// `env` must be a valid JNI environment.
+unsafe fn new_java_string(env: *mut JNIEnv, value: &str) -> Option<jobject> {
+    let units: Vec<u16> = value.encode_utf16().collect();
+    let string = (table(env).NewString.unwrap())(env, units.as_ptr(), units.len() as i32);
+    (!string.is_null()).then_some(string)
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +585,17 @@ type NiofsGetFileSizeExFn = unsafe extern "system" fn(*mut JNIEnv, jobject, i64)
 type NiofsGetFileInformationByHandle0Fn = unsafe extern "system" fn(*mut JNIEnv, jobject, i64, i64);
 /// `WindowsNativeDispatcher.GetFileAttributesEx0(long, long)`.
 type NiofsGetFileAttributesEx0Fn = unsafe extern "system" fn(*mut JNIEnv, jobject, i64, i64);
+/// `WindowsNativeDispatcher.GetFileAttributes0(long)`.
+type NiofsGetFileAttributes0Fn = unsafe extern "system" fn(*mut JNIEnv, jobject, i64) -> i32;
+/// `WindowsNativeDispatcher.FindFirstFile0(long, FirstFile)`.
+type NiofsFindFirstFile0Fn = unsafe extern "system" fn(*mut JNIEnv, jobject, i64, jobject);
+/// `WindowsNativeDispatcher.GetFinalPathNameByHandle(long)`.
+type NiofsGetFinalPathNameByHandleFn =
+    unsafe extern "system" fn(*mut JNIEnv, jobject, i64) -> jobject;
+/// `WindowsNativeDispatcher.FindClose(long)`.
+type NiofsFindCloseFn = unsafe extern "system" fn(*mut JNIEnv, jobject, i64);
+/// `WindowsNativeDispatcher.CloseHandle(long)`.
+type NiofsCloseHandleFn = unsafe extern "system" fn(*mut JNIEnv, jobject, i64);
 /// `NativeLibraries.load(NativeLibraryImpl, String, boolean, boolean)`.
 type NativeLibrariesLoadFn =
     unsafe extern "system" fn(*mut JNIEnv, jobject, jobject, jobject, u8, u8) -> u8;
@@ -560,6 +633,11 @@ struct Trampolines {
     niofs_get_file_size_ex: NiofsGetFileSizeExFn,
     niofs_get_file_information_by_handle0: NiofsGetFileInformationByHandle0Fn,
     niofs_get_file_attributes_ex0: NiofsGetFileAttributesEx0Fn,
+    niofs_get_file_attributes0: NiofsGetFileAttributes0Fn,
+    niofs_find_first_file0: NiofsFindFirstFile0Fn,
+    niofs_get_final_path_name_by_handle: NiofsGetFinalPathNameByHandleFn,
+    niofs_find_close: NiofsFindCloseFn,
+    niofs_close_handle: NiofsCloseHandleFn,
     nativelibs_load: NativeLibrariesLoadFn,
     nativelibs_unload: NativeLibrariesUnloadFn,
     nativelibs_find_builtin_lib: NativeLibrariesFindBuiltinFn,
@@ -584,36 +662,47 @@ fn trampolines() -> &'static Trampolines {
 
 /// `RandomAccessFile.open0(String path, int mode)`.
 ///
-/// The `mode` argument is the JDK's packed `O_RDONLY`/`O_RDWR`/`O_SYNC` flags.
-/// Dropping it — declaring the detour with only `(this, path)` — makes the
-/// native open the file in mode 0 and return a descriptor the JDK then treats
-/// as closed, which surfaces as `IOException: Stream Closed` on the first
-/// write. That is what breaks anything opening a file read-write, log4j's
-/// rolling appender being the first casualty in a Minecraft launch.
+/// A virtual regular file is opened by allocating a synthetic handle and writing
+/// it into the receiver's `FileDescriptor.handle`. The original native open is
+/// not called: there is intentionally no disk file to open. Read-write access is
+/// deliberately passed through so the stock JDK raises its normal error instead
+/// of silently discarding writes.
 unsafe extern "system" fn detour_open0(env: *mut JNIEnv, this: jobject, path: jobject, mode: i32) {
+    const O_RDWR: i32 = 2;
     enter("raf.open0");
 
-    // The original must run first: the JDK opens the real (zero-length)
-    // placeholder, which is what makes the file appear to exist. Skipping it
-    // makes `ZipFile` fail with "Stream Closed".
-    //
-    // It may also legitimately throw, and the JDK's own caller handles that.
-    // Probing the receiver before the call has settled would leave a pending
-    // exception behind, which poisons every later JNI call on this thread.
-    (trampolines().open0)(env, this, path, mode);
+    let requested = java_string(env, path)
+        .map(|raw| crate::vfs::pathkey::normalize_str(&raw))
+        .filter(|path| virtual_node(path) == Some(false));
+    let Some(virtual_path) = requested else {
+        record_miss(None);
+        (trampolines().open0)(env, this, path, mode);
+        return;
+    };
+    if mode & O_RDWR != 0 {
+        record_miss(Some(&virtual_path));
+        (trampolines().open0)(env, this, path, mode);
+        return;
+    }
 
-    match hollow_path(env, this) {
-        Some(path) => {
-            // A fresh open rewinds the cursor. `ZipFile` seeks explicitly
-            // afterwards, so this only matters for the first read.
-            cursors().lock().insert(raf_cursor_key(&path), 0);
-            // This is the one place both the path and the descriptor are
-            // visible at once, so it is where the association is established
-            // for the detours that only receive a descriptor.
-            remember_fd_path(env, this, &path);
-            record_hit(Some(&path));
-        }
-        None => record_miss(None),
+    let Some(bytes) = hollow_bytes(&virtual_path) else {
+        record_miss(Some(&virtual_path));
+        (trampolines().open0)(env, this, path, mode);
+        return;
+    };
+    let Some(handle) = open_virtual_file(&virtual_path, bytes, false) else {
+        record_miss(Some(&virtual_path));
+        (trampolines().open0)(env, this, path, mode);
+        return;
+    };
+    if set_receiver_file_descriptor_handle(env, this, handle) {
+        record_hit(Some(&virtual_path));
+    } else {
+        close_virtual_handle(handle);
+        record_miss(Some(&virtual_path));
+        // Publishing the descriptor failed. Let the JDK produce its normal
+        // exception rather than return from a constructor with an unusable FD.
+        (trampolines().open0)(env, this, path, mode);
     }
 }
 
@@ -625,24 +714,18 @@ unsafe extern "system" fn detour_read_bytes0(
     length: i32,
 ) -> i32 {
     enter("raf.readBytes0");
-    let Some(path) = hollow_path(env, this) else {
+    let handle = file_descriptor_handle_of(env, this);
+    let Some((path, bytes, cursor, _)) = virtual_file_state(handle) else {
         record_miss(None);
         return (trampolines().read_bytes0)(env, this, array, offset, length);
     };
-    let Some(bytes) = hollow_bytes(&path) else {
-        record_miss(Some(&path));
-        return (trampolines().read_bytes0)(env, this, array, offset, length);
-    };
 
-    let mut cursors = cursors().lock();
-    let position = cursors.entry(raf_cursor_key(&path)).or_insert(0);
-    let start = (*position).max(0) as usize;
+    let start = cursor.max(0) as usize;
     let remaining = bytes.len().saturating_sub(start);
     let count = remaining.min(length.max(0) as usize);
     if count == 0 {
         record_hit(Some(&path));
-        // EOF is -1, not 0: `ZipFile` relies on it to stop reading.
-        return -1;
+        return -1; // EOF
     }
 
     let t = table(env);
@@ -653,103 +736,83 @@ unsafe extern "system" fn detour_read_bytes0(
         count as i32,
         bytes[start..start + count].as_ptr().cast::<i8>(),
     );
-    *position += count as i64;
+    advance_virtual_file(handle, count as i64);
     record_hit(Some(&path));
     count as i32
 }
 
 unsafe extern "system" fn detour_read0(env: *mut JNIEnv, this: jobject) -> i32 {
     enter("raf.read0");
-    let Some(path) = hollow_path(env, this) else {
+    let handle = file_descriptor_handle_of(env, this);
+    let Some((path, bytes, cursor, _)) = virtual_file_state(handle) else {
         record_miss(None);
         return (trampolines().read0)(env, this);
     };
-    let Some(bytes) = hollow_bytes(&path) else {
-        record_miss(Some(&path));
-        return (trampolines().read0)(env, this);
-    };
 
-    let mut cursors = cursors().lock();
-    let position = cursors.entry(raf_cursor_key(&path)).or_insert(0);
-    let index = (*position).max(0) as usize;
-    if index >= bytes.len() {
+    let index = cursor.max(0) as usize;
+    let Some(&byte) = bytes.get(index) else {
         record_hit(Some(&path));
         return -1;
-    }
-    let byte = bytes[index];
-    *position += 1;
+    };
+    advance_virtual_file(handle, 1);
     record_hit(Some(&path));
     i32::from(byte)
 }
 
 unsafe extern "system" fn detour_length0(env: *mut JNIEnv, this: jobject) -> i64 {
     enter("raf.length0");
-    let Some(path) = hollow_path(env, this) else {
-        record_miss(None);
-        return (trampolines().length0)(env, this);
-    };
-    let Some(bytes) = hollow_bytes(&path) else {
-        record_miss(Some(&path));
-        return (trampolines().length0)(env, this);
-    };
-
-    record_hit(Some(&path));
-    // The placeholder is zero bytes; reporting that would make `ZipFile` give
-    // up immediately, since it seeks relative to the end of the file.
-    bytes.len() as i64
+    let handle = file_descriptor_handle_of(env, this);
+    if let Some((path, bytes, _, _)) = virtual_file_state(handle) {
+        record_hit(Some(&path));
+        return bytes.len() as i64;
+    }
+    record_miss(None);
+    (trampolines().length0)(env, this)
 }
 
 unsafe extern "system" fn detour_seek0(env: *mut JNIEnv, this: jobject, position: i64) -> i64 {
     enter("raf.seek0");
-    // DIAG
-    {
-        let t = table(env);
-        let pending_before = t.ExceptionCheck.map(|c| c(env) != 0).unwrap_or(false);
-        let p = string_field(env, this, "path");
-        let pending_after = t.ExceptionCheck.map(|c| c(env) != 0).unwrap_or(false);
-        if pending_before || pending_after || p.is_none() {
-            eprintln!(
-                "[diag] seek0 pending_before={pending_before} pending_after={pending_after} path={:?}",
-                p.as_deref().map(|s| &s[..s.len().min(60)])
-            );
-        }
-    }
-    let Some(path) = hollow_path(env, this) else {
+    let handle = file_descriptor_handle_of(env, this);
+    let Some(path) = seek_virtual_file(handle, position) else {
         record_miss(None);
         return (trampolines().seek0)(env, this, position);
     };
-
-    cursors().lock().insert(raf_cursor_key(&path), position);
     record_hit(Some(&path));
     position
 }
 
 unsafe extern "system" fn detour_get_file_pointer(env: *mut JNIEnv, this: jobject) -> i64 {
     enter("raf.getFilePointer");
-    let Some(path) = hollow_path(env, this) else {
+    let handle = file_descriptor_handle_of(env, this);
+    let Some((path, _, cursor, _)) = virtual_file_state(handle) else {
         record_miss(None);
         return (trampolines().get_file_pointer)(env, this);
     };
-
-    let position = *cursors().lock().entry(raf_cursor_key(&path)).or_insert(0);
     record_hit(Some(&path));
-    position
+    cursor
 }
 
-/// `FileDescriptor.close0` — the receiver is the descriptor, not a stream, so
-/// there is no `path` to resolve and nothing to serve. Cursor state is left in
-/// place: the next open of the same file resets it, and pruning it here would
-/// need a descriptor-to-path map whose reliability was just disproved.
+/// `FileDescriptor.close0` for a synthetic virtual handle.
+///
+/// The OS close is skipped and the descriptor is set to `-1`, exactly as the JDK
+/// native method does. Removing the open-table entry also guarantees that a
+/// later handle value cannot inherit this open file's cursor.
 unsafe extern "system" fn detour_fd_close0(env: *mut JNIEnv, this: jobject) {
     enter("fd.close0");
-    (trampolines().fd_close0)(env, this);
+    let handle = file_descriptor_handle(env, this);
+    if !is_virtual_handle(handle) {
+        record_miss(None);
+        (trampolines().fd_close0)(env, this);
+        return;
+    }
+    let path = close_virtual_handle(handle).map(|entry| match entry {
+        VirtualHandle::File { path, .. } | VirtualHandle::Find { path, .. } => path,
+    });
+    set_long_field(env, this, "handle", -1);
+    record_hit(path.as_deref());
 }
 
 /// `WinNTFileSystem.getLength0(File)` — `File.length()`.
-///
-/// Must report the virtual length. Code that sizes a buffer from
-/// `File.length()` and then reads through `FileInputStream` would otherwise
-/// allocate zero bytes and fail far from the cause.
 unsafe extern "system" fn detour_fs_get_length0(
     env: *mut JNIEnv,
     this: jobject,
@@ -760,36 +823,54 @@ unsafe extern "system" fn detour_fs_get_length0(
         record_miss(None);
         return (trampolines().fs_get_length0)(env, this, file);
     };
-    let Some(bytes) = hollow_bytes(&path) else {
-        record_miss(Some(&path));
-        return (trampolines().fs_get_length0)(env, this, file);
-    };
-
-    record_hit(Some(&path));
-    bytes.len() as i64
+    match hollow_bytes(&path) {
+        Some(bytes) => {
+            record_hit(Some(&path));
+            bytes.len() as i64
+        }
+        None if virtual_node(&path) == Some(true) => {
+            record_hit(Some(&path));
+            0
+        }
+        None => {
+            record_miss(Some(&path));
+            (trampolines().fs_get_length0)(env, this, file)
+        }
+    }
 }
 
 /// `WinNTFileSystem.getBooleanAttributes0(File)`.
 ///
-/// The JVM's `File` attribute bits: `BA_EXISTS = 0x01`, `BA_REGULAR = 0x02`,
-/// `BA_DIRECTORY = 0x04`, `BA_HIDDEN = 0x08`. A hollow placeholder is a real
-/// zero-byte file, so the original already reports "exists, regular" for it —
-/// which is correct and needs no override. This detour only exists to *count*
-/// the call so the trace shows whether `File`-based existence checks were
-/// exercised, and to stay correct if a future mode uses non-materialized paths.
+/// The JDK constants are stable ABI for this method. Virtual regular files and
+/// ancestor directories are answered directly because there is no disk file for
+/// the original implementation to stat.
 unsafe extern "system" fn detour_fs_get_boolean_attributes0(
     env: *mut JNIEnv,
     this: jobject,
     file: jobject,
 ) -> i32 {
+    const BA_EXISTS: i32 = 0x01;
+    const BA_REGULAR: i32 = 0x02;
+    const BA_DIRECTORY: i32 = 0x04;
     enter("fs.getBooleanAttributes0");
-    let result = (trampolines().fs_get_boolean_attributes0)(env, this, file);
-    if hollow_path_of_file(env, file).is_some() {
-        record_hit(None);
-    } else {
+    let Some(path) = hollow_path_of_file(env, file) else {
         record_miss(None);
+        return (trampolines().fs_get_boolean_attributes0)(env, this, file);
+    };
+    match virtual_node(&path) {
+        Some(false) => {
+            record_hit(Some(&path));
+            BA_EXISTS | BA_REGULAR
+        }
+        Some(true) => {
+            record_hit(Some(&path));
+            BA_EXISTS | BA_DIRECTORY
+        }
+        None => {
+            record_miss(Some(&path));
+            (trampolines().fs_get_boolean_attributes0)(env, this, file)
+        }
     }
-    result
 }
 
 /// `FileDispatcherImpl.size0(FileDescriptor)` — `Files.size`.
@@ -799,23 +880,16 @@ unsafe extern "system" fn detour_nio_size0(
     fd_obj: jobject,
 ) -> i64 {
     enter("nio.size0");
-    let Some(path) = hollow_path_for_descriptor(env, fd_obj) else {
+    let handle = file_descriptor_handle(env, fd_obj);
+    let Some((path, bytes, _, _)) = virtual_file_state(handle) else {
         record_miss(None);
         return (trampolines().nio_size0)(env, this, fd_obj);
     };
-    let Some(bytes) = hollow_bytes(&path) else {
-        record_miss(Some(&path));
-        return (trampolines().nio_size0)(env, this, fd_obj);
-    };
-
     record_hit(Some(&path));
     bytes.len() as i64
 }
 
 /// `FileDispatcherImpl.read0(FileDescriptor, long address, int len)`.
-///
-/// The destination is a raw native address, not a Java array, so the bytes are
-/// copied directly with `ptr::copy_nonoverlapping`.
 unsafe extern "system" fn detour_nio_read0(
     env: *mut JNIEnv,
     this: jobject,
@@ -825,18 +899,12 @@ unsafe extern "system" fn detour_nio_read0(
 ) -> i32 {
     enter("nio.read0");
     let handle = file_descriptor_handle(env, fd_obj);
-    let Some(path) = hollow_path_for_descriptor(env, fd_obj) else {
+    let Some((path, bytes, cursor, _)) = virtual_file_state(handle) else {
         record_miss(None);
         return (trampolines().nio_read0)(env, this, fd_obj, address, len);
     };
-    let Some(bytes) = hollow_bytes(&path) else {
-        record_miss(Some(&path));
-        return (trampolines().nio_read0)(env, this, fd_obj, address, len);
-    };
 
-    let mut cursors = cursors().lock();
-    let position = cursors.entry(nio_cursor_key(handle)).or_insert(0);
-    let start = (*position).max(0) as usize;
+    let start = cursor.max(0) as usize;
     let remaining = bytes.len().saturating_sub(start);
     let count = remaining.min(len.max(0) as usize);
     if count == 0 {
@@ -850,14 +918,12 @@ unsafe extern "system" fn detour_nio_read0(
             count,
         );
     }
-    *position += count as i64;
+    advance_virtual_file(handle, count as i64);
     record_hit(Some(&path));
     count as i32
 }
 
 /// `FileDispatcherImpl.pread0(FileDescriptor, long address, int len, long pos)`.
-///
-/// Like `read0` but at an explicit offset, and without disturbing the cursor.
 unsafe extern "system" fn detour_nio_pread0(
     env: *mut JNIEnv,
     this: jobject,
@@ -867,12 +933,9 @@ unsafe extern "system" fn detour_nio_pread0(
     position: i64,
 ) -> i32 {
     enter("nio.pread0");
-    let Some(path) = hollow_path_for_descriptor(env, fd_obj) else {
+    let handle = file_descriptor_handle(env, fd_obj);
+    let Some((path, bytes, _, _)) = virtual_file_state(handle) else {
         record_miss(None);
-        return (trampolines().nio_pread0)(env, this, fd_obj, address, len, position);
-    };
-    let Some(bytes) = hollow_bytes(&path) else {
-        record_miss(Some(&path));
         return (trampolines().nio_pread0)(env, this, fd_obj, address, len, position);
     };
 
@@ -903,101 +966,179 @@ unsafe extern "system" fn detour_nio_seek0(
 ) -> i64 {
     enter("nio.seek0");
     let handle = file_descriptor_handle(env, fd_obj);
-    let Some(path) = hollow_path_for_descriptor(env, fd_obj) else {
+    let Some(path) = seek_virtual_file(handle, position) else {
         record_miss(None);
         return (trampolines().nio_seek0)(env, this, fd_obj, position);
     };
-
-    cursors().lock().insert(nio_cursor_key(handle), position);
     record_hit(Some(&path));
     position
 }
 
-/// `WindowsNativeDispatcher.CreateFile0(long pathAddress, int flags, ...)`.
+/// `WindowsNativeDispatcher.CreateFile0`.
 ///
-/// This is where `Files.*` actually opens a file. The first argument is a
-/// native `LPCWSTR`, so the path is decoded from raw UTF-16 and matched
-/// against the session. When it matches, the handle this call returns is
-/// recorded, which is what lets the `FileDispatcherImpl` reads — which only
-/// see the handle — find their way back to the artifact.
-///
-/// The handle is recorded after the original returns, since the original is
-/// what produces it.
+/// Virtual read-only `OPEN_EXISTING` opens allocate a synthetic handle before
+/// the OS is called. Other access and creation dispositions fall through so the
+/// JDK retains its normal create/write/error behavior.
 unsafe extern "system" fn detour_niofs_create_file0(
     env: *mut JNIEnv,
     this: jobject,
     path_address: i64,
-    flags: i32,
-    mode: i32,
-    attributes: i64,
-    is_directory: i32,
-    follow_links: i32,
+    desired_access: i32,
+    share_mode: i32,
+    security_attributes: i64,
+    creation_disposition: i32,
+    flags_and_attributes: i32,
 ) -> i64 {
+    const GENERIC_WRITE: i32 = 0x4000_0000;
+    const OPEN_EXISTING: i32 = 3;
     enter("niofs.createFile0");
 
-    // Resolve the path before the call, so the match does not depend on the
-    // resulting handle.
-    let wanted = (|| -> Option<String> {
-        let vfs = current_vfs()?;
+    let requested = (|| -> Option<(String, bool)> {
         let raw = wide_c_string_to_string(path_address)?;
         let normalized = crate::vfs::pathkey::normalize_str(&raw);
-        vfs.resolve_path(&normalized).map(|_| normalized)
+        let is_directory = virtual_node(&normalized)?;
+        Some((normalized, is_directory))
     })();
 
-    let handle = (trampolines().niofs_create_file0)(
-        env,
-        this,
-        path_address,
-        flags,
-        mode,
-        attributes,
-        is_directory,
-        follow_links,
-    );
+    let Some((path, is_directory)) = requested else {
+        record_miss(None);
+        return (trampolines().niofs_create_file0)(
+            env,
+            this,
+            path_address,
+            desired_access,
+            share_mode,
+            security_attributes,
+            creation_disposition,
+            flags_and_attributes,
+        );
+    };
 
-    match wanted {
-        Some(path) if handle != 0 && handle != -1 => {
-            handle_paths().lock().insert(handle, path.clone());
-            record_hit(Some(&path));
-        }
-        Some(path) => record_miss(Some(&path)),
-        None => record_miss(None),
+    if desired_access & GENERIC_WRITE != 0 || creation_disposition != OPEN_EXISTING {
+        record_miss(Some(&path));
+        return (trampolines().niofs_create_file0)(
+            env,
+            this,
+            path_address,
+            desired_access,
+            share_mode,
+            security_attributes,
+            creation_disposition,
+            flags_and_attributes,
+        );
     }
 
-    handle
+    let bytes = if is_directory {
+        Arc::from(Vec::new().into_boxed_slice())
+    } else {
+        let Some(bytes) = hollow_bytes(&path) else {
+            record_miss(Some(&path));
+            return (trampolines().niofs_create_file0)(
+                env,
+                this,
+                path_address,
+                desired_access,
+                share_mode,
+                security_attributes,
+                creation_disposition,
+                flags_and_attributes,
+            );
+        };
+        bytes
+    };
+    match open_virtual_file(&path, bytes, is_directory) {
+        Some(handle) => {
+            record_hit(Some(&path));
+            handle
+        }
+        None => {
+            record_miss(Some(&path));
+            (trampolines().niofs_create_file0)(
+                env,
+                this,
+                path_address,
+                desired_access,
+                share_mode,
+                security_attributes,
+                creation_disposition,
+                flags_and_attributes,
+            )
+        }
+    }
 }
 
 /// `WindowsNativeDispatcher.GetFileSizeEx(long handle)`.
-///
-/// The size the nio filesystem layer reports for a hollow path.
 unsafe extern "system" fn detour_niofs_get_file_size_ex(
     env: *mut JNIEnv,
     this: jobject,
     handle: i64,
 ) -> i64 {
     enter("niofs.getFileSizeEx");
-    let Some(path) = hollow_path_for_handle(handle) else {
+    let Some((path, bytes, _, _)) = virtual_file_state(handle) else {
         record_miss(None);
         return (trampolines().niofs_get_file_size_ex)(env, this, handle);
     };
-    let Some(bytes) = hollow_bytes(&path) else {
-        record_miss(Some(&path));
-        return (trampolines().niofs_get_file_size_ex)(env, this, handle);
-    };
-
     record_hit(Some(&path));
     bytes.len() as i64
 }
 
-/// `WindowsNativeDispatcher.GetFileInformationByHandle0(long handle, long addr)`.
+/// `WindowsNativeDispatcher.GetFileAttributes0(long pathAddress)`.
+unsafe extern "system" fn detour_niofs_get_file_attributes0(
+    env: *mut JNIEnv,
+    this: jobject,
+    path_address: i64,
+) -> i32 {
+    const FILE_ATTRIBUTE_READONLY: i32 = 0x0000_0001;
+    const FILE_ATTRIBUTE_DIRECTORY: i32 = 0x0000_0010;
+    const FILE_ATTRIBUTE_NORMAL: i32 = 0x0000_0080;
+    enter("niofs.getFileAttributes0");
+
+    let requested = (|| {
+        let raw = wide_c_string_to_string(path_address)?;
+        let normalized = crate::vfs::pathkey::normalize_str(&raw);
+        let is_directory = virtual_node(&normalized)?;
+        Some((normalized, is_directory))
+    })();
+    let Some((path, is_directory)) = requested else {
+        record_miss(None);
+        return (trampolines().niofs_get_file_attributes0)(env, this, path_address);
+    };
+    record_hit(Some(&path));
+    if is_directory {
+        FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY
+    } else {
+        FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_READONLY
+    }
+}
+
+/// Fill the layout shared by `WIN32_FILE_ATTRIBUTE_DATA` and the initial fields
+/// of `BY_HANDLE_FILE_INFORMATION`.
 ///
-/// This is what `Files.size` actually reaches. It does not return a value: the
-/// original fills a `BY_HANDLE_FILE_INFORMATION` into the caller's native
-/// buffer, so the detour runs it first and then overwrites the two size fields
-/// for a hollow handle.
+/// # Safety
 ///
-/// Offsets come from `WindowsFileAttributes.fromFileInformation`, which reads
-/// `nFileSizeHigh` at 28 and `nFileSizeLow` at 32.
+/// `address` must point to at least 36 writable bytes supplied by the JDK.
+unsafe fn write_attribute_data(address: i64, is_directory: bool, len: u64) -> bool {
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+    if address == 0 {
+        return false;
+    }
+    let base = address as *mut u8;
+    let attributes = if is_directory {
+        FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY
+    } else {
+        FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_READONLY
+    };
+    // SAFETY: the JDK supplies this exact native output buffer.
+    std::ptr::write_bytes(base, 0, 36);
+    std::ptr::write_unaligned(base.cast::<u32>(), attributes);
+    std::ptr::write_unaligned(base.add(28).cast::<u32>(), (len >> 32) as u32);
+    std::ptr::write_unaligned(base.add(32).cast::<u32>(), len as u32);
+    true
+}
+
+/// `WindowsNativeDispatcher.GetFileInformationByHandle0(long, long)`.
 unsafe extern "system" fn detour_niofs_get_file_information_by_handle0(
     env: *mut JNIEnv,
     this: jobject,
@@ -1005,42 +1146,26 @@ unsafe extern "system" fn detour_niofs_get_file_information_by_handle0(
     address: i64,
 ) {
     enter("niofs.getFileInfoByHandle0");
-    (trampolines().niofs_get_file_information_by_handle0)(env, this, handle, address);
-
-    let Some(path) = hollow_path_for_handle(handle) else {
+    let Some((path, bytes, _, _)) = virtual_file_state(handle) else {
         record_miss(None);
+        (trampolines().niofs_get_file_information_by_handle0)(env, this, handle, address);
         return;
     };
-    let Some(bytes) = hollow_bytes(&path) else {
+    let len = bytes.len() as u64;
+    if write_attribute_data(address, false, len) {
+        // BY_HANDLE_FILE_INFORMATION continues with volume/file identity fields.
+        // Zeroes preserve the common attributes and sizes while making the file
+        // identity explicitly synthetic.
+        if address != 0 {
+            std::ptr::write_bytes((address + 36) as *mut u8, 0, 16);
+        }
+        record_hit(Some(&path));
+    } else {
         record_miss(Some(&path));
-        return;
-    };
-    if address == 0 {
-        record_miss(Some(&path));
-        return;
     }
-
-    let size = bytes.len() as u64;
-    let base = address as *mut u8;
-    // SAFETY: the JDK passed this address to receive exactly this structure,
-    // and the original call above wrote it. Writing the two fields back is the
-    // same access it performs.
-    std::ptr::write_unaligned(base.add(28).cast::<u32>(), (size >> 32) as u32);
-    std::ptr::write_unaligned(base.add(32).cast::<u32>(), size as u32);
-
-    record_hit(Some(&path));
 }
 
 /// `WindowsNativeDispatcher.GetFileAttributesEx0(long pathAddress, long buffer)`.
-///
-/// This is what `Files.size` actually reaches. It is the best hook point of
-/// the three nio candidates: the path arrives as a native wide string *and*
-/// the buffer the caller will read the size from is passed in, so neither a
-/// handle mapping nor a synthesized return value is needed.
-///
-/// The original runs first (so a genuinely missing file still reports
-/// `ERROR_FILE_NOT_FOUND`), and then the two size fields are overwritten for a
-/// hollow path.
 unsafe extern "system" fn detour_niofs_get_file_attributes_ex0(
     env: *mut JNIEnv,
     this: jobject,
@@ -1048,51 +1173,137 @@ unsafe extern "system" fn detour_niofs_get_file_attributes_ex0(
     buffer: i64,
 ) {
     enter("niofs.getFileAttributesEx0");
-    (trampolines().niofs_get_file_attributes_ex0)(env, this, path_address, buffer);
-
-    let wanted = (|| -> Option<String> {
-        let vfs = current_vfs()?;
+    let requested = (|| {
         let raw = wide_c_string_to_string(path_address)?;
         let normalized = crate::vfs::pathkey::normalize_str(&raw);
-        vfs.resolve_path(&normalized).map(|_| normalized)
+        let is_directory = virtual_node(&normalized)?;
+        let len = if is_directory {
+            0
+        } else {
+            hollow_bytes(&normalized)?.len() as u64
+        };
+        Some((normalized, is_directory, len))
     })();
-
-    let Some(path) = wanted else {
+    let Some((path, is_directory, len)) = requested else {
         record_miss(None);
+        (trampolines().niofs_get_file_attributes_ex0)(env, this, path_address, buffer);
         return;
     };
-    let Some(bytes) = hollow_bytes(&path) else {
+    if write_attribute_data(buffer, is_directory, len) {
+        record_hit(Some(&path));
+    } else {
         record_miss(Some(&path));
-        return;
-    };
-    if buffer == 0 {
-        record_miss(Some(&path));
-        return;
     }
+}
 
-    let size = bytes.len() as u64;
-    let base = buffer as *mut u8;
-    // SAFETY: the JDK passed this address to receive a
-    // `WIN32_FILE_ATTRIBUTE_DATA`, and the original call above wrote it.
-    // Correcting the two size fields is the same access it performs.
-    std::ptr::write_unaligned(base.add(28).cast::<u32>(), (size >> 32) as u32);
-    std::ptr::write_unaligned(base.add(32).cast::<u32>(), size as u32);
+/// `WindowsNativeDispatcher.FindFirstFile0(long pathAddress, FirstFile obj)`.
+///
+/// `Path.toRealPath()` resolves every component through this method. Virtual
+/// role directories therefore need synthetic find handles and final names even
+/// though they do not exist on disk.
+unsafe extern "system" fn detour_niofs_find_first_file0(
+    env: *mut JNIEnv,
+    this: jobject,
+    path_address: i64,
+    first_file: jobject,
+) {
+    const FILE_ATTRIBUTE_READONLY: i32 = 0x0000_0001;
+    const FILE_ATTRIBUTE_DIRECTORY: i32 = 0x0000_0010;
+    const FILE_ATTRIBUTE_NORMAL: i32 = 0x0000_0080;
+    enter("niofs.findFirstFile0");
 
+    let requested = (|| {
+        let raw = wide_c_string_to_string(path_address)?;
+        if raw.ends_with('*') {
+            return None;
+        }
+        let normalized = crate::vfs::pathkey::normalize_str(&raw);
+        let is_directory = virtual_node(&normalized)?;
+        Some((normalized, is_directory))
+    })();
+    let Some((path, is_directory)) = requested else {
+        record_miss(None);
+        (trampolines().niofs_find_first_file0)(env, this, path_address, first_file);
+        return;
+    };
+    let Some(handle) = open_virtual_find(&path) else {
+        record_miss(Some(&path));
+        (trampolines().niofs_find_first_file0)(env, this, path_address, first_file);
+        return;
+    };
+    let name = path.rsplit('\\').next().unwrap_or(&path);
+    set_long_field(env, first_file, "handle", handle);
+    set_string_field(env, first_file, "name", name);
+    set_int_field(
+        env,
+        first_file,
+        "attributes",
+        if is_directory {
+            FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY
+        } else {
+            FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_READONLY
+        },
+    );
     record_hit(Some(&path));
 }
 
+/// `WindowsNativeDispatcher.GetFinalPathNameByHandle(long)`.
+unsafe extern "system" fn detour_niofs_get_final_path_name_by_handle(
+    env: *mut JNIEnv,
+    this: jobject,
+    handle: i64,
+) -> jobject {
+    enter("niofs.getFinalPathNameByHandle");
+    let Some((path, _, _, _)) = virtual_file_state(handle) else {
+        record_miss(None);
+        return (trampolines().niofs_get_final_path_name_by_handle)(env, this, handle);
+    };
+    record_hit(Some(&path));
+    new_java_string(env, &path).unwrap_or(std::ptr::null_mut())
+}
+
+/// `WindowsNativeDispatcher.FindClose(long)`.
+unsafe extern "system" fn detour_niofs_find_close(env: *mut JNIEnv, this: jobject, handle: i64) {
+    enter("niofs.findClose");
+    if !is_virtual_handle(handle) {
+        record_miss(None);
+        (trampolines().niofs_find_close)(env, this, handle);
+        return;
+    }
+    let path = close_virtual_handle(handle).map(|entry| match entry {
+        VirtualHandle::File { path, .. } | VirtualHandle::Find { path, .. } => path,
+    });
+    record_hit(path.as_deref());
+}
+
+/// `WindowsNativeDispatcher.CloseHandle(long)`.
+unsafe extern "system" fn detour_niofs_close_handle(env: *mut JNIEnv, this: jobject, handle: i64) {
+    enter("niofs.closeHandle");
+    if !is_virtual_handle(handle) {
+        record_miss(None);
+        (trampolines().niofs_close_handle)(env, this, handle);
+        return;
+    }
+    let path = close_virtual_handle(handle).map(|entry| match entry {
+        VirtualHandle::File { path, .. } | VirtualHandle::Find { path, .. } => path,
+    });
+    record_hit(path.as_deref());
+}
+
 /// `FileDispatcherImpl.close0(FileDescriptor)`.
-///
-/// Closes for real so the placeholder handle is released, and forgets the
-/// descriptor association so a later reuse of the same descriptor number by an
-/// unrelated file cannot be mistaken for ours.
 unsafe extern "system" fn detour_nio_close0(env: *mut JNIEnv, this: jobject, fd_obj: jobject) {
     enter("nio.close0");
     let handle = file_descriptor_handle(env, fd_obj);
-    if handle != 0 && handle != -1 {
-        handle_paths().lock().remove(&handle);
+    if !is_virtual_handle(handle) {
+        record_miss(None);
+        (trampolines().nio_close0)(env, this, fd_obj);
+        return;
     }
-    (trampolines().nio_close0)(env, this, fd_obj);
+    let path = close_virtual_handle(handle).map(|entry| match entry {
+        VirtualHandle::File { path, .. } | VirtualHandle::Find { path, .. } => path,
+    });
+    set_long_field(env, fd_obj, "handle", -1);
+    record_hit(path.as_deref());
 }
 
 /// `NativeLibraries.findBuiltinLib(String name)`.
@@ -1360,21 +1571,24 @@ unsafe fn invoke_jni_on_load(env: *mut JNIEnv, handle: i64) -> Option<i32> {
     Some(on_load(vm.cast::<c_void>(), std::ptr::null_mut()))
 }
 
-/// Read a `java.lang.String` argument as Rust text.
+/// Read a `java.lang.String` argument as Rust text using UTF-16.
 unsafe fn java_string(env: *mut JNIEnv, value: jobject) -> Option<String> {
     if value.is_null() {
         return None;
     }
     let t = table(env);
-    let len = (t.GetStringUTFLength.unwrap())(env, value);
-    let chars = (t.GetStringUTFChars.unwrap())(env, value, std::ptr::null_mut());
+    let len = (t.GetStringLength.unwrap())(env, value);
+    if len < 0 {
+        return None;
+    }
+    let mut is_copy: jni::sys::jboolean = 0;
+    let chars = (t.GetStringChars.unwrap())(env, value, &mut is_copy);
     if chars.is_null() {
         return None;
     }
-    let text = std::str::from_utf8(std::slice::from_raw_parts(chars as *const u8, len as usize))
-        .ok()
-        .map(str::to_string);
-    (t.ReleaseStringUTFChars.unwrap())(env, value, chars);
+    let units = std::slice::from_raw_parts(chars, len as usize);
+    let text = String::from_utf16(units).ok();
+    (t.ReleaseStringChars.unwrap())(env, value, chars);
     text
 }
 
@@ -1526,7 +1740,7 @@ impl HookSet {
         // nio.dll is NOT: the JDK loads it on first NIO use, which may never
         // happen if the application never touches Files. Resolving its exports
         // therefore requires forcing the load, or the hooks silently never
-        // install and Files.size keeps reporting the placeholder's zero.
+        // install and Files.size keeps bypassing the virtual artifact.
         let nio_module = load_module(java_home.join("bin").join("nio.dll"))?;
 
         let mut resolved: HashMap<&'static str, *mut c_void> = HashMap::new();
@@ -1598,6 +1812,12 @@ impl HookSet {
             niofs_get_file_information_by_handle0:
                 unreachable_stub_niofs_get_file_information_by_handle0,
             niofs_get_file_attributes_ex0: unreachable_stub_niofs_get_file_attributes_ex0,
+            niofs_get_file_attributes0: unreachable_stub_niofs_get_file_attributes0,
+            niofs_find_first_file0: unreachable_stub_niofs_find_first_file0,
+            niofs_get_final_path_name_by_handle:
+                unreachable_stub_niofs_get_final_path_name_by_handle,
+            niofs_find_close: unreachable_stub_niofs_find_close,
+            niofs_close_handle: unreachable_stub_niofs_close_handle,
             nativelibs_load: unreachable_stub_nativelibs_load,
             nativelibs_unload: unreachable_stub_nativelibs_unload,
             nativelibs_find_builtin_lib: unreachable_stub_nativelibs_find_builtin_lib,
@@ -1606,7 +1826,7 @@ impl HookSet {
             raw_unload0: unreachable_stub_raw_unload0,
         };
 
-        let plan: [(&str, *mut c_void); 24] = [
+        let plan: Vec<(&str, *mut c_void)> = vec![
             (
                 "Java_java_io_RandomAccessFile_open0",
                 detour_open0 as *mut c_void,
@@ -1678,6 +1898,26 @@ impl HookSet {
             (
                 "Java_sun_nio_fs_WindowsNativeDispatcher_GetFileAttributesEx0",
                 detour_niofs_get_file_attributes_ex0 as *mut c_void,
+            ),
+            (
+                "Java_sun_nio_fs_WindowsNativeDispatcher_GetFileAttributes0",
+                detour_niofs_get_file_attributes0 as *mut c_void,
+            ),
+            (
+                "Java_sun_nio_fs_WindowsNativeDispatcher_FindFirstFile0",
+                detour_niofs_find_first_file0 as *mut c_void,
+            ),
+            (
+                "Java_sun_nio_fs_WindowsNativeDispatcher_FindClose",
+                detour_niofs_find_close as *mut c_void,
+            ),
+            (
+                "Java_sun_nio_fs_WindowsNativeDispatcher_CloseHandle",
+                detour_niofs_close_handle as *mut c_void,
+            ),
+            (
+                "Java_sun_nio_fs_WindowsNativeDispatcher_GetFinalPathNameByHandle",
+                detour_niofs_get_final_path_name_by_handle as *mut c_void,
             ),
             (
                 "Java_jdk_internal_loader_NativeLibraries_load",
@@ -1830,6 +2070,26 @@ unsafe fn store_trampoline(symbol: &str, original: *mut c_void, trampolines: &mu
             trampolines.niofs_get_file_attributes_ex0 =
                 std::mem::transmute::<*mut c_void, NiofsGetFileAttributesEx0Fn>(original);
         }
+        "Java_sun_nio_fs_WindowsNativeDispatcher_GetFileAttributes0" => {
+            trampolines.niofs_get_file_attributes0 =
+                std::mem::transmute::<*mut c_void, NiofsGetFileAttributes0Fn>(original);
+        }
+        "Java_sun_nio_fs_WindowsNativeDispatcher_FindFirstFile0" => {
+            trampolines.niofs_find_first_file0 =
+                std::mem::transmute::<*mut c_void, NiofsFindFirstFile0Fn>(original);
+        }
+        "Java_sun_nio_fs_WindowsNativeDispatcher_GetFinalPathNameByHandle" => {
+            trampolines.niofs_get_final_path_name_by_handle =
+                std::mem::transmute::<*mut c_void, NiofsGetFinalPathNameByHandleFn>(original);
+        }
+        "Java_sun_nio_fs_WindowsNativeDispatcher_FindClose" => {
+            trampolines.niofs_find_close =
+                std::mem::transmute::<*mut c_void, NiofsFindCloseFn>(original);
+        }
+        "Java_sun_nio_fs_WindowsNativeDispatcher_CloseHandle" => {
+            trampolines.niofs_close_handle =
+                std::mem::transmute::<*mut c_void, NiofsCloseHandleFn>(original);
+        }
         "Java_jdk_internal_loader_NativeLibraries_load" => {
             trampolines.nativelibs_load =
                 std::mem::transmute::<*mut c_void, NativeLibrariesLoadFn>(original);
@@ -1963,6 +2223,34 @@ extern "system" fn unreachable_stub_niofs_get_file_attributes_ex0(
 ) {
     unreachable!("detour called before trampolines were installed")
 }
+extern "system" fn unreachable_stub_niofs_get_file_attributes0(
+    _: *mut JNIEnv,
+    _: jobject,
+    _: i64,
+) -> i32 {
+    unreachable!("detour called before trampolines were installed")
+}
+extern "system" fn unreachable_stub_niofs_find_first_file0(
+    _: *mut JNIEnv,
+    _: jobject,
+    _: i64,
+    _: jobject,
+) {
+    unreachable!("detour called before trampolines were installed")
+}
+extern "system" fn unreachable_stub_niofs_get_final_path_name_by_handle(
+    _: *mut JNIEnv,
+    _: jobject,
+    _: i64,
+) -> jobject {
+    unreachable!("detour called before trampolines were installed")
+}
+extern "system" fn unreachable_stub_niofs_find_close(_: *mut JNIEnv, _: jobject, _: i64) {
+    unreachable!("detour called before trampolines were installed")
+}
+extern "system" fn unreachable_stub_niofs_close_handle(_: *mut JNIEnv, _: jobject, _: i64) {
+    unreachable!("detour called before trampolines were installed")
+}
 extern "system" fn unreachable_stub_nativelibs_load(
     _: *mut JNIEnv,
     _: jobject,
@@ -2029,13 +2317,18 @@ pub enum InstallError {
 mod tests {
     use super::*;
 
+    /// These tests observe process-wide VFS state, so they must not overlap.
+    static VFS_STATE_TESTS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn a_thread_without_a_session_reports_none() {
+        let _state = VFS_STATE_TESTS.lock();
         assert!(current_vfs().is_none());
     }
 
     #[test]
     fn installing_a_session_is_scoped_to_the_closure() {
+        let _state = VFS_STATE_TESTS.lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let vfs =
             Arc::new(VirtualFileSystem::create(dir.path().join("session")).expect("create vfs"));
@@ -2051,6 +2344,7 @@ mod tests {
 
     #[test]
     fn launch_session_is_visible_to_worker_threads() {
+        let _state = VFS_STATE_TESTS.lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let vfs =
             Arc::new(VirtualFileSystem::create(dir.path().join("session")).expect("create vfs"));
@@ -2071,6 +2365,7 @@ mod tests {
     }
     #[test]
     fn sessions_nest_and_unwind_correctly() {
+        let _state = VFS_STATE_TESTS.lock();
         let dir_a = tempfile::tempdir().expect("tempdir a");
         let dir_b = tempfile::tempdir().expect("tempdir b");
         let a = Arc::new(VirtualFileSystem::create(dir_a.path().join("s")).expect("vfs a"));
@@ -2091,12 +2386,27 @@ mod tests {
     }
 
     #[test]
-    fn cursors_start_at_zero_and_advance() {
-        cursors().lock().clear();
+    fn synthetic_opens_have_independent_cursors() {
+        let bytes: Arc<[u8]> = Arc::from([1, 2, 3, 4]);
+        let first = open_virtual_file("first", Arc::clone(&bytes), false).expect("open");
+        let second = open_virtual_file("second", Arc::clone(&bytes), false).expect("open");
 
-        assert_eq!(*cursors().lock().entry("x".into()).or_insert(0), 0);
-        cursors().lock().insert("x".into(), 42);
-        assert_eq!(*cursors().lock().get("x").expect("present"), 42);
+        assert_eq!(
+            virtual_file_state(first).map(|(_, _, cursor, _)| cursor),
+            Some(0)
+        );
+        assert_eq!(seek_virtual_file(first, 3), Some("first".into()));
+        assert_eq!(
+            virtual_file_state(second).map(|(_, _, cursor, _)| cursor),
+            Some(0)
+        );
+        assert!(
+            close_virtual_handle(first).is_some(),
+            "a closed handle must never be reused"
+        );
+        assert!(virtual_file_state(first).is_none());
+        assert!(virtual_file_state(second).is_some());
+        close_virtual_handle(second);
     }
 
     #[test]

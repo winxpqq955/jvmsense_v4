@@ -285,7 +285,7 @@ LAUNCH OPTIONS:
     JVMSENSE_JRE        A JDK home, equivalent to --jdk
 
 The game jar's bytes are read into memory and never re-read from disk: the path
-the JVM sees is a zero-length placeholder whose reads the launcher answers.
+the JVM sees is a virtual path whose reads the launcher answers.
 ",
         env!("CARGO_PKG_VERSION")
     );

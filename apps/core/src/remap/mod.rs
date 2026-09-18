@@ -2,8 +2,7 @@
 //!
 //! The Java helpers in this module use TinyRemapper's in-memory output callback
 //! and write a complete jar image to stdout. Rust reads that pipe into memory,
-//! so the only filesystem artifact for a transformed payload is the zero-length
-//! hollow placeholder owned by the virtual file system.
+//! so a transformed payload has no filesystem artifact in the virtual file system.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

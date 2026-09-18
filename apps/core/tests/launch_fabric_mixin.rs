@@ -166,13 +166,7 @@ fn modmenu_is_mixed_in_at_target_class_load_time() {
             classpath_string.contains(path.as_ref()),
             "missing from classpath: {path}"
         );
-        assert_eq!(
-            std::fs::metadata(entry.path())
-                .expect("stat launch-time mod placeholder")
-                .len(),
-            0,
-            "mod bytes leaked to {path}"
-        );
+        assert!(!entry.path().exists(), "mod artifact leaked to {path}");
     }
 
     // Keep Fabric's working directory inside the test directory so an
@@ -285,8 +279,8 @@ fn modmenu_is_mixed_in_at_target_class_load_time() {
         "Mixin must transform class_442 during its first class load"
     );
     assert!(
-        vfs.disk_footprint().iter().all(|(_, len)| *len == 0),
-        "all launch-time placeholders must remain zero bytes"
+        vfs.disk_footprint().is_empty(),
+        "no launch-time artifact may be materialized on disk"
     );
     assert!(
         !jvmsense_core::native::trace_snapshot().entries.is_empty(),
