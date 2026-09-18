@@ -45,7 +45,7 @@ The Windows native layer is an open/read implementation for virtual paths, not a
 
 - **Path classification.** The VFS answers each normalized path as a virtual regular file, a virtual ancestor directory, or no virtual node. Unknown paths go to the stock JDK/Windows implementation.
 - **Synthetic handles.** Read-only opens allocate unique negative handles from a process-local table. Each handle owns its byte buffer and cursor, so independent opens of one artifact cannot share file offsets. Closing removes the table entry and invalidates the Java file descriptor.
-- **Legacy I/O.** `java.io.RandomAccessFile` open, read, bulk read, length, seek, pointer, and close are connected to the synthetic handle table. Write modes use the original JDK implementation and therefore receive normal read/write errors.
+- **Legacy I/O.** `java.io.RandomAccessFile` and `FileInputStream` open, read, bulk read, length, position, skip, availability, regular-file checks, and close are connected to the synthetic handle table. Write modes use the original JDK implementation and therefore receive normal read/write errors.
 - **NIO.** `WindowsNativeDispatcher.CreateFile0` serves read-only `OPEN_EXISTING` requests, while NIO read, positional read, seek, size, and close operations use per-handle state. Other access and creation modes pass through.
 - **Metadata and traversal.** Attribute, file-information, size, find-first, find-close, final-path, and `File` attribute/length requests are synthesized so `Path.toRealPath()`, `Files`, `JarFile`, and `ZipFile` observe a consistent filesystem shape.
 - **Audit.** The session root is scanned recursively after launch; any regular file, empty or not, is a materialization failure.

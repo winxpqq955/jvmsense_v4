@@ -59,9 +59,11 @@ impl SymbolFamily {
 
 /// The symbols v4 installs today.
 ///
-/// Deliberately a minimal set: V1 proved `ZipFile` needs only `open0`,
-/// `length0`, `seek0` and `readBytes0`, so the nio/FileDispatcher family is
-/// not required for jar access and is not hooked yet.
+/// Archive, stream, and descriptor operations used to read virtual artifacts.
+///
+/// `ZipFile` uses `RandomAccessFile`, while libraries such as Guava use
+/// `FileInputStream` directly. Both must acquire synthetic handles so a virtual
+/// path never falls through to the host filesystem.
 pub const HOLLOW_READ_SYMBOLS: &[NativeSymbol] = &[
     NativeSymbol {
         symbol: "Java_java_io_RandomAccessFile_open0",
@@ -92,6 +94,46 @@ pub const HOLLOW_READ_SYMBOLS: &[NativeSymbol] = &[
         symbol: "Java_java_io_RandomAccessFile_getFilePointer",
         family: SymbolFamily::HollowRead,
         label: "raf.getFilePointer",
+    },
+    NativeSymbol {
+        symbol: "Java_java_io_FileInputStream_open0",
+        family: SymbolFamily::HollowRead,
+        label: "fis.open0",
+    },
+    NativeSymbol {
+        symbol: "Java_java_io_FileInputStream_read0",
+        family: SymbolFamily::HollowRead,
+        label: "fis.read0",
+    },
+    NativeSymbol {
+        symbol: "Java_java_io_FileInputStream_readBytes",
+        family: SymbolFamily::HollowRead,
+        label: "fis.readBytes",
+    },
+    NativeSymbol {
+        symbol: "Java_java_io_FileInputStream_length0",
+        family: SymbolFamily::HollowRead,
+        label: "fis.length0",
+    },
+    NativeSymbol {
+        symbol: "Java_java_io_FileInputStream_position0",
+        family: SymbolFamily::HollowRead,
+        label: "fis.position0",
+    },
+    NativeSymbol {
+        symbol: "Java_java_io_FileInputStream_skip0",
+        family: SymbolFamily::HollowRead,
+        label: "fis.skip0",
+    },
+    NativeSymbol {
+        symbol: "Java_java_io_FileInputStream_available0",
+        family: SymbolFamily::HollowRead,
+        label: "fis.available0",
+    },
+    NativeSymbol {
+        symbol: "Java_java_io_FileInputStream_isRegularFile0",
+        family: SymbolFamily::HollowRead,
+        label: "fis.isRegularFile0",
     },
     // Not a RandomAccessFile native: closing goes through FileDescriptor, and
     // the receiver is the FileDescriptor rather than the stream.
@@ -337,6 +379,18 @@ mod tests {
                 .any(|s| s.symbol.contains("RandomAccessFile_close0")),
             "RandomAccessFile has no close0 export"
         );
+        for symbol in [
+            "Java_java_io_FileInputStream_open0",
+            "Java_java_io_FileInputStream_readBytes",
+            "Java_java_io_FileInputStream_isRegularFile0",
+        ] {
+            assert!(
+                HOLLOW_READ_SYMBOLS
+                    .iter()
+                    .any(|entry| entry.symbol == symbol),
+                "FileInputStream export {symbol} must remain hooked"
+            );
+        }
     }
 
     #[test]

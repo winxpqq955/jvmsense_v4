@@ -108,6 +108,22 @@ fn report_which_read_paths_the_current_hooks_serve() {
         failures.join("\n  ")
     );
     assert!(trace.hits > 0, "the hooks served the reads");
+    for label in [
+        "fis.open0",
+        "fis.read0",
+        "fis.readBytes",
+        "fis.length0",
+        "fis.position0",
+        "fis.skip0",
+        "fis.available0",
+        "fis.isRegularFile0",
+    ] {
+        assert!(
+            trace.entries.contains_key(label),
+            "FileInputStream path did not enter {label}: {:?}",
+            trace.entries
+        );
+    }
 
     drop(_hooks);
     unsafe {
@@ -145,11 +161,15 @@ fn probes() -> Vec<PathProbe> {
             label: "RandomAccessFile.readFully(byte[])",
             java: "RafRead",
         },
+        PathProbe {
+            label: "FileInputStream.readAllBytes()",
+            java: "FileInputStream",
+        },
     ]
 }
 
 /// Run one probe and describe the outcome in one line.
-fn run_probe(env: &mut jni::JNIEnv, hollow: &Path, probe: &PathProbe, _real_len: u64) -> String {
+fn run_probe(env: &mut jni::JNIEnv, hollow: &Path, probe: &PathProbe, real_len: u64) -> String {
     let path = env
         .new_string(hollow.to_string_lossy().as_ref())
         .expect("new_string");
@@ -178,6 +198,7 @@ fn run_probe(env: &mut jni::JNIEnv, hollow: &Path, probe: &PathProbe, _real_len:
             .map(|n| format!("{n} bytes"))
             .ok_or_else(|| "exception".to_string()),
         "RafRead" => raf_read(env, &file),
+        "FileInputStream" => file_input_stream_read(env, &path, real_len),
         _ => Err("unknown probe".to_string()),
     };
 
@@ -363,4 +384,67 @@ fn raf_read(env: &mut jni::JNIEnv, file: &jni::objects::JObject) -> Result<Strin
     env.call_method(&raf, "readFully", "([B)V", &[JValue::Object(&buf)])
         .map_err(|e| format!("readFully: {e}"))?;
     Ok(format!("length {len}, read 64 bytes"))
+}
+
+fn file_input_stream_read(
+    env: &mut jni::JNIEnv,
+    path: &jni::objects::JString,
+    real_len: u64,
+) -> Result<String, String> {
+    let stream = env
+        .new_object(
+            "java/io/FileInputStream",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(path)],
+        )
+        .map_err(|e| format!("ctor: {e}"))?;
+    let first = env
+        .call_method(&stream, "read", "()I", &[])
+        .map_err(|e| format!("read: {e}"))?
+        .i()
+        .map_err(|e| format!("read value: {e}"))?;
+    if first < 0 {
+        return Err("first byte was EOF".to_string());
+    }
+    let available = env
+        .call_method(&stream, "available", "()I", &[])
+        .map_err(|e| format!("available: {e}"))?
+        .i()
+        .map_err(|e| format!("available value: {e}"))?;
+    let expected_available = real_len.saturating_sub(1).min(i32::MAX as u64) as i32;
+    if available != expected_available {
+        return Err(format!(
+            "available {available}, expected {expected_available}"
+        ));
+    }
+    let skipped = env
+        .call_method(&stream, "skip", "(J)J", &[JValue::Long(7)])
+        .map_err(|e| format!("skip: {e}"))?
+        .j()
+        .map_err(|e| format!("skip value: {e}"))?;
+    if skipped != 7 {
+        return Err(format!("skipped {skipped}, expected 7"));
+    }
+    let array = env
+        .call_method(&stream, "readAllBytes", "()[B", &[])
+        .map_err(|e| format!("readAllBytes: {e}"))?
+        .l()
+        .map_err(|e| format!("array value: {e}"))?;
+    let array = unsafe { jni::objects::JByteArray::from_raw(array.into_raw()) };
+    let bytes = env
+        .convert_byte_array(&array)
+        .map_err(|e| format!("convert: {e}"))?;
+    let expected_len = real_len.saturating_sub(8) as usize;
+    if bytes.len() != expected_len {
+        return Err(format!(
+            "read {} bytes, expected {expected_len}",
+            bytes.len()
+        ));
+    }
+    env.call_method(&stream, "close", "()V", &[])
+        .map_err(|e| format!("close: {e}"))?;
+    Ok(format!(
+        "available {available}, skipped {skipped}, read {} bytes",
+        bytes.len()
+    ))
 }

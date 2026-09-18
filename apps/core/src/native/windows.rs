@@ -239,6 +239,23 @@ fn advance_virtual_file(handle: i64, count: i64) {
     }
 }
 
+/// Move a virtual file cursor by `count`, matching `FileInputStream.skip0`.
+///
+/// Forward skips may move past EOF. Backward skips stop at byte zero, because a
+/// Windows file handle cannot seek before the beginning of a file.
+fn skip_virtual_file(handle: i64, count: i64) -> Option<(String, i64)> {
+    if !is_virtual_handle(handle) {
+        return None;
+    }
+    let mut table = virtual_opens().lock();
+    let VirtualHandle::File { path, cursor, .. } = table.handles.get_mut(&handle)? else {
+        return None;
+    };
+    let previous = *cursor;
+    *cursor = previous.saturating_add(count).max(0);
+    Some((path.clone(), cursor.saturating_sub(previous)))
+}
+
 /// Decode a NUL-terminated UTF-16 string from a native address.
 ///
 /// `WindowsNativeDispatcher` receives paths as native wide strings rather than
@@ -561,6 +578,13 @@ type ReadBytes0Fn = unsafe extern "system" fn(*mut JNIEnv, jobject, jobject, i32
 type Length0Fn = unsafe extern "system" fn(*mut JNIEnv, jobject) -> i64;
 type Seek0Fn = unsafe extern "system" fn(*mut JNIEnv, jobject, i64) -> i64;
 type GetFilePointerFn = unsafe extern "system" fn(*mut JNIEnv, jobject) -> i64;
+/// `FileInputStream.open0(String)`.
+type FileInputStreamOpen0Fn = unsafe extern "system" fn(*mut JNIEnv, jobject, jobject);
+/// `FileInputStream.available0()`.
+type FileInputStreamAvailable0Fn = unsafe extern "system" fn(*mut JNIEnv, jobject) -> i32;
+/// `FileInputStream.isRegularFile0(FileDescriptor)`.
+type FileInputStreamIsRegularFile0Fn =
+    unsafe extern "system" fn(*mut JNIEnv, jobject, jobject) -> u8;
 type FileDescriptorClose0Fn = unsafe extern "system" fn(*mut JNIEnv, jobject);
 /// `WinNTFileSystem.getLength0(File)`.
 type GetLength0Fn = unsafe extern "system" fn(*mut JNIEnv, jobject, jobject) -> i64;
@@ -621,6 +645,14 @@ struct Trampolines {
     length0: Length0Fn,
     seek0: Seek0Fn,
     get_file_pointer: GetFilePointerFn,
+    fis_open0: FileInputStreamOpen0Fn,
+    fis_read0: Read0Fn,
+    fis_read_bytes: ReadBytes0Fn,
+    fis_length0: Length0Fn,
+    fis_position0: GetFilePointerFn,
+    fis_skip0: Seek0Fn,
+    fis_available0: FileInputStreamAvailable0Fn,
+    fis_is_regular_file0: FileInputStreamIsRegularFile0Fn,
     fd_close0: FileDescriptorClose0Fn,
     fs_get_length0: GetLength0Fn,
     fs_get_boolean_attributes0: GetBooleanAttributes0Fn,
@@ -790,6 +822,164 @@ unsafe extern "system" fn detour_get_file_pointer(env: *mut JNIEnv, this: jobjec
     };
     record_hit(Some(&path));
     cursor
+}
+
+/// `FileInputStream.open0(String)`.
+///
+/// Guava and Mod Menu use `FileInputStream` to hash mod origins. A virtual
+/// artifact must receive the same synthetic descriptor that archive and NIO
+/// paths use, otherwise this API falls through to the absent disk path.
+unsafe extern "system" fn detour_fis_open0(env: *mut JNIEnv, this: jobject, path: jobject) {
+    enter("fis.open0");
+    let requested = java_string(env, path)
+        .map(|raw| crate::vfs::pathkey::normalize_str(&raw))
+        .filter(|path| virtual_node(path) == Some(false));
+    let Some(virtual_path) = requested else {
+        record_miss(None);
+        (trampolines().fis_open0)(env, this, path);
+        return;
+    };
+    let Some(bytes) = hollow_bytes(&virtual_path) else {
+        record_miss(Some(&virtual_path));
+        (trampolines().fis_open0)(env, this, path);
+        return;
+    };
+    let Some(handle) = open_virtual_file(&virtual_path, bytes, false) else {
+        record_miss(Some(&virtual_path));
+        (trampolines().fis_open0)(env, this, path);
+        return;
+    };
+    if set_receiver_file_descriptor_handle(env, this, handle) {
+        record_hit(Some(&virtual_path));
+    } else {
+        close_virtual_handle(handle);
+        record_miss(Some(&virtual_path));
+        (trampolines().fis_open0)(env, this, path);
+    }
+}
+
+/// `FileInputStream.read0()`.
+unsafe extern "system" fn detour_fis_read0(env: *mut JNIEnv, this: jobject) -> i32 {
+    enter("fis.read0");
+    let handle = file_descriptor_handle_of(env, this);
+    let Some((path, bytes, cursor, _)) = virtual_file_state(handle) else {
+        record_miss(None);
+        return (trampolines().fis_read0)(env, this);
+    };
+    let index = cursor.max(0) as usize;
+    let Some(&byte) = bytes.get(index) else {
+        record_hit(Some(&path));
+        return -1;
+    };
+    advance_virtual_file(handle, 1);
+    record_hit(Some(&path));
+    i32::from(byte)
+}
+
+/// `FileInputStream.readBytes(byte[], int, int)`.
+unsafe extern "system" fn detour_fis_read_bytes(
+    env: *mut JNIEnv,
+    this: jobject,
+    array: jobject,
+    offset: i32,
+    length: i32,
+) -> i32 {
+    enter("fis.readBytes");
+    let handle = file_descriptor_handle_of(env, this);
+    let Some((path, bytes, cursor, _)) = virtual_file_state(handle) else {
+        record_miss(None);
+        return (trampolines().fis_read_bytes)(env, this, array, offset, length);
+    };
+    if length == 0 {
+        record_hit(Some(&path));
+        return 0;
+    }
+    let start = cursor.max(0) as usize;
+    let remaining = bytes.len().saturating_sub(start);
+    let count = remaining.min(length.max(0) as usize);
+    if count == 0 {
+        record_hit(Some(&path));
+        return -1;
+    }
+    let t = table(env);
+    (t.SetByteArrayRegion.unwrap())(
+        env,
+        array,
+        offset,
+        count as i32,
+        bytes[start..start + count].as_ptr().cast::<i8>(),
+    );
+    advance_virtual_file(handle, count as i64);
+    record_hit(Some(&path));
+    count as i32
+}
+
+/// `FileInputStream.length0()`.
+unsafe extern "system" fn detour_fis_length0(env: *mut JNIEnv, this: jobject) -> i64 {
+    enter("fis.length0");
+    let handle = file_descriptor_handle_of(env, this);
+    if let Some((path, bytes, _, _)) = virtual_file_state(handle) {
+        record_hit(Some(&path));
+        return bytes.len() as i64;
+    }
+    record_miss(None);
+    (trampolines().fis_length0)(env, this)
+}
+
+/// `FileInputStream.position0()`.
+unsafe extern "system" fn detour_fis_position0(env: *mut JNIEnv, this: jobject) -> i64 {
+    enter("fis.position0");
+    let handle = file_descriptor_handle_of(env, this);
+    let Some((path, _, cursor, _)) = virtual_file_state(handle) else {
+        record_miss(None);
+        return (trampolines().fis_position0)(env, this);
+    };
+    record_hit(Some(&path));
+    cursor
+}
+
+/// `FileInputStream.skip0(long)`.
+unsafe extern "system" fn detour_fis_skip0(env: *mut JNIEnv, this: jobject, count: i64) -> i64 {
+    enter("fis.skip0");
+    let handle = file_descriptor_handle_of(env, this);
+    let Some((path, skipped)) = skip_virtual_file(handle, count) else {
+        record_miss(None);
+        return (trampolines().fis_skip0)(env, this, count);
+    };
+    record_hit(Some(&path));
+    skipped
+}
+
+/// `FileInputStream.available0()`.
+unsafe extern "system" fn detour_fis_available0(env: *mut JNIEnv, this: jobject) -> i32 {
+    enter("fis.available0");
+    let handle = file_descriptor_handle_of(env, this);
+    let Some((path, bytes, cursor, _)) = virtual_file_state(handle) else {
+        record_miss(None);
+        return (trampolines().fis_available0)(env, this);
+    };
+    let available = bytes
+        .len()
+        .saturating_sub(cursor.max(0) as usize)
+        .min(i32::MAX as usize) as i32;
+    record_hit(Some(&path));
+    available
+}
+
+/// `FileInputStream.isRegularFile0(FileDescriptor)`.
+unsafe extern "system" fn detour_fis_is_regular_file0(
+    env: *mut JNIEnv,
+    this: jobject,
+    fd_obj: jobject,
+) -> u8 {
+    enter("fis.isRegularFile0");
+    let handle = file_descriptor_handle(env, fd_obj);
+    if let Some((path, _, _, is_directory)) = virtual_file_state(handle) {
+        record_hit(Some(&path));
+        return u8::from(!is_directory);
+    }
+    record_miss(None);
+    (trampolines().fis_is_regular_file0)(env, this, fd_obj)
 }
 
 /// `FileDescriptor.close0` for a synthetic virtual handle.
@@ -1799,6 +1989,14 @@ impl HookSet {
             length0: unreachable_stub_length0,
             seek0: unreachable_stub_seek0,
             get_file_pointer: unreachable_stub_get_file_pointer,
+            fis_open0: unreachable_stub_fis_open0,
+            fis_read0: unreachable_stub_read0,
+            fis_read_bytes: unreachable_stub_read_bytes0,
+            fis_length0: unreachable_stub_length0,
+            fis_position0: unreachable_stub_get_file_pointer,
+            fis_skip0: unreachable_stub_seek0,
+            fis_available0: unreachable_stub_fis_available0,
+            fis_is_regular_file0: unreachable_stub_fis_is_regular_file0,
             fd_close0: unreachable_stub_fd_close0,
             fs_get_length0: unreachable_stub_get_length0,
             fs_get_boolean_attributes0: unreachable_stub_get_boolean_attributes0,
@@ -1850,6 +2048,38 @@ impl HookSet {
             (
                 "Java_java_io_RandomAccessFile_getFilePointer",
                 detour_get_file_pointer as *mut c_void,
+            ),
+            (
+                "Java_java_io_FileInputStream_open0",
+                detour_fis_open0 as *mut c_void,
+            ),
+            (
+                "Java_java_io_FileInputStream_read0",
+                detour_fis_read0 as *mut c_void,
+            ),
+            (
+                "Java_java_io_FileInputStream_readBytes",
+                detour_fis_read_bytes as *mut c_void,
+            ),
+            (
+                "Java_java_io_FileInputStream_length0",
+                detour_fis_length0 as *mut c_void,
+            ),
+            (
+                "Java_java_io_FileInputStream_position0",
+                detour_fis_position0 as *mut c_void,
+            ),
+            (
+                "Java_java_io_FileInputStream_skip0",
+                detour_fis_skip0 as *mut c_void,
+            ),
+            (
+                "Java_java_io_FileInputStream_available0",
+                detour_fis_available0 as *mut c_void,
+            ),
+            (
+                "Java_java_io_FileInputStream_isRegularFile0",
+                detour_fis_is_regular_file0 as *mut c_void,
             ),
             (
                 "Java_java_io_FileDescriptor_close0",
@@ -2028,6 +2258,34 @@ unsafe fn store_trampoline(symbol: &str, original: *mut c_void, trampolines: &mu
             trampolines.get_file_pointer =
                 std::mem::transmute::<*mut c_void, GetFilePointerFn>(original);
         }
+        "Java_java_io_FileInputStream_open0" => {
+            trampolines.fis_open0 =
+                std::mem::transmute::<*mut c_void, FileInputStreamOpen0Fn>(original);
+        }
+        "Java_java_io_FileInputStream_read0" => {
+            trampolines.fis_read0 = std::mem::transmute::<*mut c_void, Read0Fn>(original);
+        }
+        "Java_java_io_FileInputStream_readBytes" => {
+            trampolines.fis_read_bytes = std::mem::transmute::<*mut c_void, ReadBytes0Fn>(original);
+        }
+        "Java_java_io_FileInputStream_length0" => {
+            trampolines.fis_length0 = std::mem::transmute::<*mut c_void, Length0Fn>(original);
+        }
+        "Java_java_io_FileInputStream_position0" => {
+            trampolines.fis_position0 =
+                std::mem::transmute::<*mut c_void, GetFilePointerFn>(original);
+        }
+        "Java_java_io_FileInputStream_skip0" => {
+            trampolines.fis_skip0 = std::mem::transmute::<*mut c_void, Seek0Fn>(original);
+        }
+        "Java_java_io_FileInputStream_available0" => {
+            trampolines.fis_available0 =
+                std::mem::transmute::<*mut c_void, FileInputStreamAvailable0Fn>(original);
+        }
+        "Java_java_io_FileInputStream_isRegularFile0" => {
+            trampolines.fis_is_regular_file0 =
+                std::mem::transmute::<*mut c_void, FileInputStreamIsRegularFile0Fn>(original);
+        }
         "Java_java_io_FileDescriptor_close0" => {
             trampolines.fd_close0 =
                 std::mem::transmute::<*mut c_void, FileDescriptorClose0Fn>(original);
@@ -2121,6 +2379,9 @@ unsafe fn store_trampoline(symbol: &str, original: *mut c_void, trampolines: &mu
 extern "system" fn unreachable_stub_open0(_: *mut JNIEnv, _: jobject, _: jobject, _: i32) {
     unreachable!("detour called before trampolines were installed")
 }
+extern "system" fn unreachable_stub_fis_open0(_: *mut JNIEnv, _: jobject, _: jobject) {
+    unreachable!("detour called before trampolines were installed")
+}
 extern "system" fn unreachable_stub_read0(_: *mut JNIEnv, _: jobject) -> i32 {
     unreachable!("detour called before trampolines were installed")
 }
@@ -2140,6 +2401,16 @@ extern "system" fn unreachable_stub_seek0(_: *mut JNIEnv, _: jobject, _: i64) ->
     unreachable!("detour called before trampolines were installed")
 }
 extern "system" fn unreachable_stub_get_file_pointer(_: *mut JNIEnv, _: jobject) -> i64 {
+    unreachable!("detour called before trampolines were installed")
+}
+extern "system" fn unreachable_stub_fis_available0(_: *mut JNIEnv, _: jobject) -> i32 {
+    unreachable!("detour called before trampolines were installed")
+}
+extern "system" fn unreachable_stub_fis_is_regular_file0(
+    _: *mut JNIEnv,
+    _: jobject,
+    _: jobject,
+) -> u8 {
     unreachable!("detour called before trampolines were installed")
 }
 extern "system" fn unreachable_stub_fd_close0(_: *mut JNIEnv, _: jobject) {
@@ -2407,6 +2678,35 @@ mod tests {
         assert!(virtual_file_state(first).is_none());
         assert!(virtual_file_state(second).is_some());
         close_virtual_handle(second);
+    }
+
+    #[test]
+    fn virtual_file_input_skips_can_cross_eof_and_rewind_to_zero() {
+        let bytes: Arc<[u8]> = Arc::from([1, 2, 3, 4]);
+        let handle = open_virtual_file("stream", bytes, false).expect("open");
+
+        assert_eq!(
+            skip_virtual_file(handle, 9),
+            Some(("stream".to_string(), 9))
+        );
+        assert_eq!(
+            virtual_file_state(handle).map(|(_, _, cursor, _)| cursor),
+            Some(9)
+        );
+        assert_eq!(
+            skip_virtual_file(handle, -20),
+            Some(("stream".to_string(), -9))
+        );
+        assert_eq!(
+            virtual_file_state(handle).map(|(_, _, cursor, _)| cursor),
+            Some(0)
+        );
+        assert_eq!(
+            skip_virtual_file(handle, -1),
+            Some(("stream".to_string(), 0))
+        );
+
+        close_virtual_handle(handle);
     }
 
     #[test]
